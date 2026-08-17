@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1a1a2e"/>
+      <stop offset="100%" stop-color="#0d0d1a"/>
+    </linearGradient>
+    <linearGradient id="flame" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0%" stop-color="#ff6600"/>
+      <stop offset="40%" stop-color="#ffaa00"/>
+      <stop offset="100%" stop-color="#ffee88"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="50%" cy="45%" r="40%">
+      <stop offset="0%" stop-color="#ffcc44" stop-opacity="0.4"/>
+      <stop offset="100%" stop-color="#ffcc44" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="base" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#8888aa"/>
+      <stop offset="100%" stop-color="#555577"/>
+    </linearGradient>
+  </defs>
+  <!-- Background circle -->
+  <circle cx="128" cy="128" r="120" fill="url(#bg)" stroke="#c8aa6e" stroke-width="4"/>
+  <!-- Glow -->
+  <circle cx="128" cy="110" r="100" fill="url(#glow)"/>
+  <!-- Lantern base / handle -->
+  <rect x="112" y="155" width="32" height="50" rx="4" fill="url(#base)" stroke="#c8aa6e" stroke-width="2"/>
+  <rect x="106" y="150" width="44" height="10" rx="3" fill="#c8aa6e"/>
+  <rect x="106" y="200" width="44" height="10" rx="3" fill="#c8aa6e"/>
+  <!-- Grip lines -->
+  <line x1="116" y1="168" x2="140" y2="168" stroke="#c8aa6e" stroke-width="1" stroke-opacity="0.5"/>
+  <line x1="116" y1="178" x2="140" y2="178" stroke="#c8aa6e" stroke-width="1" stroke-opacity="0.5"/>
+  <line x1="116" y1="188" x2="140" y2="188" stroke="#c8aa6e" stroke-width="1" stroke-opacity="0.5"/>
+  <!-- Flame -->
+  <path d="M128 60 C140 85, 158 100, 155 125 C153 140, 142 150, 128 150 C114 150, 103 140, 101 125 C98 100, 116 85, 128 60Z" fill="url(#flame)"/>
+  <!-- Inner flame -->
+  <path d="M128 80 C135 95, 145 105, 143 122 C142 135, 135 145, 128 145 C121 145, 114 135, 113 122 C111 105, 121 95, 128 80Z" fill="#ffee88" fill-opacity="0.6"/>
+  <!-- Bright core -->
+  <ellipse cx="128" cy="130" rx="10" ry="15" fill="#ffffcc" fill-opacity="0.7"/>
+  <!-- Arc / light rays -->
+  <path d="M80 70 Q100 50, 128 45 Q156 50, 176 70" fill="none" stroke="#ffcc44" stroke-width="3" stroke-opacity="0.6" stroke-linecap="round"/>
+  <path d="M90 55 Q110 38, 128 34 Q146 38, 166 55" fill="none" stroke="#ffcc44" stroke-width="2" stroke-opacity="0.4" stroke-linecap="round"/>
+</svg>

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Arclight
+Comment=Native Linux launcher for World of Warcraft
+Exec=arclight
+Icon=arclight
+Terminal=false
+Type=Application
+Categories=Game;
+Keywords=wow;warcraft;blizzard;wine;
