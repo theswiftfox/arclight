@@ -12,18 +12,24 @@ fn main() -> iced::Result {
 
     tracing::info!("Starting Arclight");
 
-    iced::application("Arclight - WoW Launcher", ui::App::update, ui::App::view)
-        .theme(|_| ui::theme::wow_theme())
-        .decorations(false)
-        .window(iced::window::Settings {
-            size: iced::Size::new(800.0, 500.0),
-            decorations: false,
-            platform_specific: iced::window::settings::PlatformSpecific {
-                application_id: "arclight".to_string(),
-                ..Default::default()
-            },
-            ..Default::default()
-        })
+    iced::daemon(ui::App::title, ui::App::update, ui::App::view)
+        .subscription(ui::App::subscription)
+        .theme(|_, _| ui::theme::wow_theme())
         .font(include_bytes!("../assets/NotoEmoji-Regular.ttf"))
-        .run_with(ui::App::new)
+        .run_with(|| {
+            let (app, task) = ui::App::new();
+            let open_main = {
+                let (id, open) = iced::window::open(iced::window::Settings {
+                    size: iced::Size::new(800.0, 500.0),
+                    decorations: false,
+                    platform_specific: iced::window::settings::PlatformSpecific {
+                        application_id: "arclight".to_string(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                });
+                open.map(move |_| ui::Message::MainWindowOpened(id))
+            };
+            (app, iced::Task::batch([task, open_main]))
+        })
 }

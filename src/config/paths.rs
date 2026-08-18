@@ -25,10 +25,16 @@ impl AppPaths {
             .join("arclight")
     }
 
-    /// Default wine prefix location
+    /// Default wine prefix location (used for Battle.net)
     #[must_use]
     pub fn default_prefix() -> PathBuf {
         Self::data_dir().join("prefix")
+    }
+
+    /// Default `WoW` wine prefix location
+    #[must_use]
+    pub fn default_wow_prefix() -> PathBuf {
+        Self::data_dir().join("wow_prefix")
     }
 
     /// Log directory

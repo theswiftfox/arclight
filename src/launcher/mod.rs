@@ -4,7 +4,12 @@ pub mod process;
 
 use std::path::PathBuf;
 
-use crate::config::{Config, RunnerConfig, RunnerType};
+use tokio::sync::mpsc;
+
+use crate::{
+    config::{Config, RunnerConfig, RunnerType},
+    ui::logs::LogEntry,
+};
 
 /// A detected Wine/Proton runner
 #[derive(Debug, Clone)]
@@ -35,10 +40,15 @@ pub fn get_runner(config: &RunnerConfig) -> anyhow::Result<Runner> {
 
 /// Launch `WoW` with the given config.
 /// `use_launcherlogin`: whether to pass -launcherlogin -uid wow (requires ACCOUNT in registry)
+/// `log_sender`: if provided, subprocess stdout/stderr will be piped and sent through this channel.
 ///
 /// # Errors
 /// Returns an error if the game path is not configured, the executable is not found, or launch fails.
-pub async fn launch(config: &Config, use_launcherlogin: bool) -> anyhow::Result<()> {
+pub async fn launch(
+    config: &Config,
+    use_launcherlogin: bool,
+    log_sender: Option<mpsc::UnboundedSender<LogEntry>>,
+) -> anyhow::Result<()> {
     let game_path = config
         .game_path
         .as_ref()
@@ -70,5 +80,5 @@ pub async fn launch(config: &Config, use_launcherlogin: bool) -> anyhow::Result<
     let runner = get_runner(&config.runner)?;
     tracing::info!("Using runner: {} ({})", runner.name, runner.path.display());
 
-    process::launch_game(&runner, &wow_exe, config, use_launcherlogin).await
+    process::launch_game(&runner, &wow_exe, config, use_launcherlogin, log_sender).await
 }

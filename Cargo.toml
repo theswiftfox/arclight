@@ -6,7 +6,7 @@ description = "A native Linux launcher for World of Warcraft"
 
 [dependencies]
 # GUI
-iced = { version = "0.13", features = ["tokio"] }
+iced = { version = "0.13", features = ["tokio", "multi-window"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -32,3 +32,9 @@ thiserror = "2"
 
 # Process & system
 which = "7"
+
+# Clipboard
+arboard = "3"
+
+# Time
+chrono = "0.4"

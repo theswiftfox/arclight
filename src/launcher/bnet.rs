@@ -1,10 +1,15 @@
-use std::path::Path;
+use std::{path::Path, process::Stdio};
 
-use tokio::process::Command;
+use tokio::{
+    io::{AsyncBufReadExt, BufReader},
+    process::Command,
+    sync::mpsc,
+};
 
 use crate::{
     config::{AppPaths, Config, RunnerType},
     launcher::{Runner, get_runner},
+    ui::logs::LogEntry,
 };
 
 const BNET_INSTALLER_URL: &str = "https://www.battle.net/download/getInstallerForGame?os=win&version=LIVE&gameProgram=BATTLENET_APP";
@@ -171,7 +176,10 @@ pub async fn install_bnet(config: &Config, installer_path: Option<&Path>) -> any
 ///
 /// # Errors
 /// Returns an error if Battle.net is not installed, the runner cannot be resolved, or the process fails to spawn.
-pub async fn launch_bnet(config: &Config) -> anyhow::Result<()> {
+pub async fn launch_bnet(
+    config: &Config,
+    log_sender: Option<mpsc::UnboundedSender<LogEntry>>,
+) -> anyhow::Result<()> {
     let bnet_exe = config.bnet_exe_path();
     if !bnet_exe.exists() {
         anyhow::bail!(
@@ -197,9 +205,17 @@ pub async fn launch_bnet(config: &Config) -> anyhow::Result<()> {
         cmd.env(key, value);
     }
 
-    let _child = cmd
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("Failed to launch Battle.net: {e}"))?;
+    if let Some(sender) = log_sender {
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("Failed to launch Battle.net: {e}"))?;
+        spawn_log_readers(&mut child, sender);
+    } else {
+        let _child = cmd
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("Failed to launch Battle.net: {e}"))?;
+    }
 
     tracing::info!("Battle.net launched, waiting for all prefix processes to exit...");
 
@@ -357,6 +373,30 @@ async fn create_prefix(runner: &Runner, prefix: &Path) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Spawn background tasks that read stdout/stderr from a child process and send log entries.
+fn spawn_log_readers(child: &mut tokio::process::Child, sender: mpsc::UnboundedSender<LogEntry>) {
+    if let Some(stdout) = child.stdout.take() {
+        let tx = sender.clone();
+        tokio::spawn(async move {
+            let reader = BufReader::new(stdout);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let _ = tx.send(LogEntry::new("BNet", line));
+            }
+        });
+    }
+    if let Some(stderr) = child.stderr.take() {
+        let tx = sender;
+        tokio::spawn(async move {
+            let reader = BufReader::new(stderr);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let _ = tx.send(LogEntry::new("BNet", line));
+            }
+        });
+    }
 }
 
 #[cfg(test)]

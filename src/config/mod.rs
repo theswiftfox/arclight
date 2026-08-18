@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -62,8 +62,10 @@ pub struct Config {
 pub struct RunnerConfig {
     /// Path to wine/proton binary (None = auto-detect)
     pub binary: Option<PathBuf>,
-    /// Wine prefix path (None = use default)
+    /// Wine prefix path for Battle.net (None = use default)
     pub prefix: Option<PathBuf>,
+    /// Wine prefix path for `WoW` (None = use default, separate from Battle.net prefix)
+    pub wow_prefix: Option<PathBuf>,
     /// Runner type
     pub runner_type: RunnerType,
     /// Enable DXVK/VKD3D
@@ -144,6 +146,7 @@ impl Default for RunnerConfig {
         Self {
             binary: None,
             prefix: None,
+            wow_prefix: None,
             runner_type: RunnerType::Wine,
             dxvk: true,
             esync: true,
@@ -188,7 +191,7 @@ impl Config {
         Ok(())
     }
 
-    /// Get the effective Wine prefix path.
+    /// Get the effective Wine prefix path (used for Battle.net).
     /// For Proton, the actual prefix is under `pfx/` within the compat data path.
     pub fn prefix_path(&self) -> PathBuf {
         self.runner
@@ -197,21 +200,38 @@ impl Config {
             .unwrap_or_else(AppPaths::default_prefix)
     }
 
+    /// Get the effective Wine prefix path for `WoW` (separate from Battle.net).
+    pub fn wow_prefix_path(&self) -> PathBuf {
+        self.runner
+            .wow_prefix
+            .clone()
+            .unwrap_or_else(AppPaths::default_wow_prefix)
+    }
+
     /// Get the actual Wine prefix root (where `drive_c` lives).
     /// Proton uses `<path>/pfx/drive_c`, Wine uses `<path>/drive_c` directly.
     #[must_use]
     pub fn wine_prefix_root(&self) -> PathBuf {
-        let base = self.prefix_path();
+        Self::resolve_wine_root(&self.prefix_path(), &self.runner)
+    }
+
+    /// Get the actual Wine prefix root for the `WoW` prefix.
+    #[must_use]
+    pub fn wow_wine_prefix_root(&self) -> PathBuf {
+        Self::resolve_wine_root(&self.wow_prefix_path(), &self.runner)
+    }
+
+    /// Resolve the Wine prefix root for a given base path.
+    fn resolve_wine_root(base: &Path, runner: &RunnerConfig) -> PathBuf {
         let pfx = base.join("pfx");
         if pfx.join("drive_c").exists() {
             pfx
         } else if base.join("drive_c").exists() {
-            base
+            base.to_path_buf()
         } else {
-            // Default: check runner type
-            match self.runner.runner_type {
+            match runner.runner_type {
                 RunnerType::Proton => pfx,
-                RunnerType::Wine => base,
+                RunnerType::Wine => base.to_path_buf(),
             }
         }
     }
@@ -229,30 +249,33 @@ impl Config {
         self.bnet_exe_path().exists()
     }
 
-    /// Apply drive letter mappings to the prefix dosdevices directory.
+    /// Apply drive letter mappings to both prefix dosdevices directories.
     ///
     /// # Errors
     /// Returns an error if the dosdevices directory cannot be created or symlinks cannot be set.
     pub fn apply_drive_mappings(&self) -> anyhow::Result<()> {
-        let dosdevices = self.wine_prefix_root().join("dosdevices");
-        if !dosdevices.exists() {
-            std::fs::create_dir_all(&dosdevices)?;
-        }
-
-        for (letter, path) in &self.drive_mappings {
-            if letter.is_empty() || path.is_empty() {
-                continue;
-            }
-            let link_name = dosdevices.join(format!("{}:", letter.to_lowercase()));
-            let target = std::path::Path::new(path);
-
-            // Remove existing symlink if it exists
-            if link_name.exists() || link_name.is_symlink() {
-                std::fs::remove_file(&link_name)?;
+        let prefixes = [self.wine_prefix_root(), self.wow_wine_prefix_root()];
+        for prefix_root in &prefixes {
+            let dosdevices = prefix_root.join("dosdevices");
+            if !dosdevices.exists() {
+                std::fs::create_dir_all(&dosdevices)?;
             }
 
-            std::os::unix::fs::symlink(target, &link_name)?;
-            tracing::info!("Drive mapping: {}: -> {}", letter, path);
+            for (letter, path) in &self.drive_mappings {
+                if letter.is_empty() || path.is_empty() {
+                    continue;
+                }
+                let link_name = dosdevices.join(format!("{}:", letter.to_lowercase()));
+                let target = std::path::Path::new(path);
+
+                // Remove existing symlink if it exists
+                if link_name.exists() || link_name.is_symlink() {
+                    std::fs::remove_file(&link_name)?;
+                }
+
+                std::os::unix::fs::symlink(target, &link_name)?;
+                tracing::info!("Drive mapping: {}: -> {}", letter, path);
+            }
         }
 
         Ok(())

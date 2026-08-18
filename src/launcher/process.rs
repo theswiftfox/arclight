@@ -1,9 +1,16 @@
-use std::path::Path;
+use std::{path::Path, process::Stdio};
 
-use tokio::process::Command;
+use tokio::{
+    io::{AsyncBufReadExt, BufReader},
+    process::Command,
+    sync::mpsc,
+};
 
 use super::Runner;
-use crate::config::{Config, RunnerType};
+use crate::{
+    config::{Config, RunnerType},
+    ui::logs::LogEntry,
+};
 
 /// Launch the game using the specified runner.
 ///
@@ -14,8 +21,9 @@ pub async fn launch_game(
     wow_exe: &Path,
     config: &Config,
     use_launcherlogin: bool,
+    log_sender: Option<mpsc::UnboundedSender<LogEntry>>,
 ) -> anyhow::Result<()> {
-    let prefix = config.prefix_path();
+    let prefix = config.wow_prefix_path();
 
     // Ensure prefix exists
     if !prefix.exists() {
@@ -94,51 +102,95 @@ pub async fn launch_game(
     tracing::info!("Launching WoW: {:?}", cmd);
 
     // If gamescope is enabled, wrap the entire command
-    if config.gamescope_enabled {
-        let mut gamescope_cmd = Command::new("gamescope");
-        for arg in config.gamescope_args.split_whitespace() {
-            gamescope_cmd.arg(arg);
-        }
-        gamescope_cmd.arg("--");
+    let mut cmd = if config.gamescope_enabled {
+        with_gamescope_cmd(&cmd, config)
+    } else {
+        cmd
+    };
 
-        // Re-build the inner command as gamescope args
-        let program = cmd.as_std().get_program().to_owned();
-        gamescope_cmd.arg(&program);
-        for arg in cmd.as_std().get_args() {
-            gamescope_cmd.arg(arg);
-        }
-
-        // Copy env vars
-        for (key, val) in cmd.as_std().get_envs() {
-            if let Some(v) = val {
-                gamescope_cmd.env(key, v);
-            }
-        }
-
-        // Copy working directory
-        if let Some(dir) = cmd.as_std().get_current_dir() {
-            gamescope_cmd.current_dir(dir);
-        }
-
-        tracing::info!("Wrapping with gamescope: {:?}", gamescope_cmd);
-
-        let child = gamescope_cmd
-            .spawn()
-            .map_err(|e| anyhow::anyhow!("Failed to spawn gamescope: {e}"))?;
-        tracing::info!("WoW launched via gamescope with PID: {:?}", child.id());
-        return Ok(());
+    if let Some(sender) = log_sender {
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = cmd.spawn().map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to spawn process (runner: {}): {}",
+                runner.path.display(),
+                e
+            )
+        })?;
+        tracing::info!("WoW launched with PID: {:?}", child.id());
+        spawn_log_readers(&mut child, sender, "WoW");
+    } else {
+        let child = cmd.spawn().map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to spawn process (runner: {}): {}",
+                runner.path.display(),
+                e
+            )
+        })?;
+        tracing::info!("WoW launched with PID: {:?}", child.id());
     }
 
-    let child = cmd.spawn().map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to spawn process (runner: {}): {}",
-            runner.path.display(),
-            e
-        )
-    })?;
-    tracing::info!("WoW launched with PID: {:?}", child.id());
-
     Ok(())
+}
+
+/// wrap the command in a gamescope command, preserving args and env vars
+fn with_gamescope_cmd(cmd: &Command, config: &Config) -> Command {
+    let mut gamescope_cmd = Command::new("gamescope");
+    for arg in config.gamescope_args.split_whitespace() {
+        gamescope_cmd.arg(arg);
+    }
+    gamescope_cmd.arg("--");
+
+    // Re-build the inner command as gamescope args
+    let program = cmd.as_std().get_program().to_owned();
+    gamescope_cmd.arg(&program);
+    for arg in cmd.as_std().get_args() {
+        gamescope_cmd.arg(arg);
+    }
+
+    // Copy env vars
+    for (key, val) in cmd.as_std().get_envs() {
+        if let Some(v) = val {
+            gamescope_cmd.env(key, v);
+        }
+    }
+
+    // Copy working directory
+    if let Some(dir) = cmd.as_std().get_current_dir() {
+        gamescope_cmd.current_dir(dir);
+    }
+
+    tracing::info!("Wrapping with gamescope: {:?}", gamescope_cmd);
+
+    gamescope_cmd
+}
+
+/// Spawn background tasks that read stdout/stderr from a child process and send log entries.
+fn spawn_log_readers(
+    child: &mut tokio::process::Child,
+    sender: mpsc::UnboundedSender<LogEntry>,
+    source: &'static str,
+) {
+    if let Some(stdout) = child.stdout.take() {
+        let tx = sender.clone();
+        tokio::spawn(async move {
+            let reader = BufReader::new(stdout);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let _ = tx.send(LogEntry::new(source, line));
+            }
+        });
+    }
+    if let Some(stderr) = child.stderr.take() {
+        let tx = sender;
+        tokio::spawn(async move {
+            let reader = BufReader::new(stderr);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let _ = tx.send(LogEntry::new(source, line));
+            }
+        });
+    }
 }
 
 /// Create a new Wine prefix
