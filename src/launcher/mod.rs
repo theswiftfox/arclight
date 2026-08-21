@@ -47,6 +47,7 @@ pub fn get_runner(config: &RunnerConfig) -> anyhow::Result<Runner> {
 pub async fn launch(
     config: &Config,
     use_launcherlogin: bool,
+    gamemode_available: bool,
     log_sender: Option<mpsc::UnboundedSender<LogEntry>>,
 ) -> anyhow::Result<()> {
     let game_path = config
@@ -80,5 +81,13 @@ pub async fn launch(
     let runner = get_runner(&config.runner)?;
     tracing::info!("Using runner: {} ({})", runner.name, runner.path.display());
 
-    process::launch_game(&runner, &wow_exe, config, use_launcherlogin, log_sender).await
+    process::launch_game(
+        &runner,
+        &wow_exe,
+        config,
+        use_launcherlogin,
+        gamemode_available,
+        log_sender,
+    )
+    .await
 }

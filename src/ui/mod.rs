@@ -87,6 +87,7 @@ pub enum Message {
     MangoHudConfigChanged(String),
     GamescopeToggled(bool),
     GamescopeArgsChanged(String),
+    GameModeToggled(bool),
     // Save
     SaveSettings,
     SettingsSaved(Result<(), String>),
@@ -103,6 +104,7 @@ pub enum Message {
     WindowCloseRequested(window::Id),
 }
 
+#[allow(clippy::struct_excessive_bools)]
 pub struct App {
     screen: Screen,
     config: Config,
@@ -127,6 +129,8 @@ pub struct App {
     logs_window_id: Option<window::Id>,
     // Window IDs
     main_window_id: Option<window::Id>,
+    // Tool availability
+    gamemode_installed: bool,
 }
 
 impl App {
@@ -167,6 +171,10 @@ impl App {
             log_receiver: Arc::new(std::sync::Mutex::new(Some(log_receiver))),
             logs_window_id: None,
             main_window_id: None,
+            gamemode_installed: std::process::Command::new("which")
+                .arg("gamemoderun")
+                .output()
+                .is_ok_and(|o| o.status.success()),
         };
 
         let task = Task::perform(async { detect_runners_async() }, Message::RunnersDetected);
@@ -370,9 +378,10 @@ impl App {
         };
 
         let use_launcherlogin = false;
+        let has_gamemode = self.gamemode_installed;
         let launch_task = Task::perform(
             async move {
-                launcher::launch(&config, use_launcherlogin, log_sender)
+                launcher::launch(&config, use_launcherlogin, has_gamemode, log_sender)
                     .await
                     .map_err(|e| e.to_string())
             },
@@ -524,6 +533,7 @@ impl App {
             Message::MangoHudConfigChanged(val) => self.config.mangohud_config = val,
             Message::GamescopeToggled(val) => self.config.gamescope_enabled = val,
             Message::GamescopeArgsChanged(val) => self.config.gamescope_args = val,
+            Message::GameModeToggled(val) => self.config.gamemode_enabled = val,
             _ => {}
         }
         Task::none()
@@ -889,6 +899,22 @@ impl App {
                 .on_input(Message::GamescopeArgsChanged)
                 .padding(8);
 
+        let gamemode_checkbox = checkbox(
+            "Enable GameMode (performance + inhibit sleep)",
+            self.config.gamemode_enabled,
+        )
+        .on_toggle(Message::GameModeToggled);
+        let gamemode_warning: Option<Element<'_, Message>> = if self.gamemode_installed {
+            None
+        } else {
+            Some(
+                text("⚠ gamemoderun not found — install gamemode to use this feature")
+                    .size(12)
+                    .color(iced::Color::from_rgb(1.0, 0.8, 0.2))
+                    .into(),
+            )
+        };
+
         // Battle.net Section
         let bnet_header = text("Battle.net Settings").size(18);
 
@@ -931,7 +957,7 @@ impl App {
                 .on_press(Message::InstallBnet)
         };
 
-        let content = column![
+        let mut content = column![
             top_bar,
             vertical_space().height(12),
             game_path_label,
@@ -963,21 +989,28 @@ impl App {
             mangohud_config_field,
             gamescope_checkbox,
             gamescope_args_field,
-            vertical_space().height(16),
-            // Battle.net section
-            bnet_header,
-            bnet_status,
-            bnet_args_label,
-            bnet_args_field,
-            bnet_env_label,
-            bnet_env_col,
-            add_bnet_env_btn,
-            vertical_space().height(8),
-            install_bnet_btn,
+            gamemode_checkbox,
         ]
         .spacing(6)
         .padding(40)
         .width(Length::Fill);
+
+        if let Some(warning) = gamemode_warning {
+            content = content.push(warning);
+        }
+
+        content = content
+            .push(vertical_space().height(16))
+            // Battle.net section
+            .push(bnet_header)
+            .push(bnet_status)
+            .push(bnet_args_label)
+            .push(bnet_args_field)
+            .push(bnet_env_label)
+            .push(bnet_env_col)
+            .push(add_bnet_env_btn)
+            .push(vertical_space().height(8))
+            .push(install_bnet_btn);
 
         iced::widget::scrollable(
             container(content)

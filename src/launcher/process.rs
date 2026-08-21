@@ -21,6 +21,7 @@ pub async fn launch_game(
     wow_exe: &Path,
     config: &Config,
     use_launcherlogin: bool,
+    gamemode_available: bool,
     log_sender: Option<mpsc::UnboundedSender<LogEntry>>,
 ) -> anyhow::Result<()> {
     let prefix = config.wow_prefix_path();
@@ -102,8 +103,15 @@ pub async fn launch_game(
     tracing::info!("Launching WoW: {:?}", cmd);
 
     // If gamescope is enabled, wrap the entire command
-    let mut cmd = if config.gamescope_enabled {
+    let cmd = if config.gamescope_enabled {
         with_gamescope_cmd(&cmd, config)
+    } else {
+        cmd
+    };
+
+    // If gamemode is enabled, wrap as outermost layer
+    let mut cmd = if config.gamemode_enabled && gamemode_available {
+        with_gamemode_cmd(&cmd)
     } else {
         cmd
     };
@@ -163,6 +171,31 @@ fn with_gamescope_cmd(cmd: &Command, config: &Config) -> Command {
     tracing::info!("Wrapping with gamescope: {:?}", gamescope_cmd);
 
     gamescope_cmd
+}
+
+/// Wrap a command with `gamemoderun` for performance optimizations and sleep inhibition.
+fn with_gamemode_cmd(cmd: &Command) -> Command {
+    let mut gamemode_cmd = Command::new("gamemoderun");
+
+    let program = cmd.as_std().get_program().to_owned();
+    gamemode_cmd.arg(&program);
+    for arg in cmd.as_std().get_args() {
+        gamemode_cmd.arg(arg);
+    }
+
+    for (key, val) in cmd.as_std().get_envs() {
+        if let Some(v) = val {
+            gamemode_cmd.env(key, v);
+        }
+    }
+
+    if let Some(dir) = cmd.as_std().get_current_dir() {
+        gamemode_cmd.current_dir(dir);
+    }
+
+    tracing::info!("Wrapping with gamemoderun: {:?}", gamemode_cmd);
+
+    gamemode_cmd
 }
 
 /// Spawn background tasks that read stdout/stderr from a child process and send log entries.

@@ -51,6 +51,9 @@ pub struct Config {
     /// Gamescope arguments (e.g. "-w 2560 -h 1440 -f")
     #[serde(default)]
     pub gamescope_args: String,
+    /// Enable `GameMode` (performance optimizations + inhibit sleep)
+    #[serde(default)]
+    pub gamemode_enabled: bool,
 
     // Legacy field (migrated to wow_env_vars on load)
     #[serde(default)]
@@ -136,6 +139,7 @@ impl Default for Config {
             mangohud_config: String::new(),
             gamescope_enabled: false,
             gamescope_args: String::new(),
+            gamemode_enabled: false,
             env_vars: Vec::new(),
         }
     }
