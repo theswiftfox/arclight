@@ -2,7 +2,10 @@ pub mod bnet;
 pub mod detect;
 pub mod process;
 
-use std::path::PathBuf;
+use std::{
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
 
 use tokio::sync::mpsc;
 
@@ -90,4 +93,122 @@ pub async fn launch(
         log_sender,
     )
     .await
+}
+
+/// Resolve the wine64 binary for a runner, accounting for Proton's directory layout.
+#[must_use]
+pub fn wine_bin_path(runner: &Runner) -> PathBuf {
+    match runner.runner_type {
+        RunnerType::Wine => runner.path.clone(),
+        RunnerType::Proton => {
+            let proton_dir = runner.path.parent().unwrap_or(Path::new("."));
+            let wine = proton_dir.join("dist/bin/wine64");
+            if wine.exists() {
+                wine
+            } else {
+                proton_dir.join("files/bin/wine64")
+            }
+        }
+    }
+}
+
+/// Resolve the `wineserver` binary alongside the runner's wine64 binary, falling back to the
+/// system `wineserver` if it isn't found there.
+#[must_use]
+pub fn wineserver_bin_path(runner: &Runner) -> PathBuf {
+    let candidate = wine_bin_path(runner)
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("wineserver");
+    if candidate.exists() {
+        candidate
+    } else {
+        PathBuf::from("wineserver")
+    }
+}
+
+/// `wineserver --wait` only waits on an *already-running* server for the prefix. Grace period
+/// during which we retry if it returns suspiciously fast (see [`wait_for_prefix_idle`]).
+const WINESERVER_STARTUP_GRACE: Duration = Duration::from_secs(20);
+/// Minimum duration a "real" wait is expected to take; a faster return means there was no
+/// server up yet rather than the prefix genuinely already being idle.
+const WINESERVER_MIN_REAL_WAIT: Duration = Duration::from_millis(200);
+/// How long to sleep between retries while waiting for the server to start.
+const WINESERVER_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Block until every process running inside the given Wine prefix has exited.
+///
+/// `wineserver --wait` means "wait until the *currently running* wineserver for this prefix
+/// terminates" — if we call it before the just-launched process has had a chance to start its
+/// own wineserver, there is no server to wait on and it returns immediately, incorrectly
+/// reporting the prefix as idle before the app has even opened a window. To avoid that race we
+/// retry while it keeps returning near-instantly, for a short startup grace period, giving the
+/// launched process time to actually come up.
+///
+/// # Errors
+/// Returns an error if `wineserver` cannot be spawned.
+pub async fn wait_for_prefix_idle(runner: &Runner, prefix: &Path) -> anyhow::Result<()> {
+    let wineserver = wineserver_bin_path(runner);
+    let deadline = Instant::now() + WINESERVER_STARTUP_GRACE;
+
+    loop {
+        let started = Instant::now();
+        let status = tokio::process::Command::new(&wineserver)
+            .arg("--wait")
+            .env("WINEPREFIX", prefix)
+            .status()
+            .await?;
+
+        if started.elapsed() >= WINESERVER_MIN_REAL_WAIT || Instant::now() >= deadline {
+            tracing::info!(
+                "All processes in {} exited (wineserver status: {status})",
+                prefix.display()
+            );
+            return Ok(());
+        }
+
+        tracing::debug!(
+            "wineserver --wait returned instantly for {}, server may not be up yet; retrying",
+            prefix.display()
+        );
+        tokio::time::sleep(WINESERVER_POLL_INTERVAL).await;
+    }
+}
+
+/// Force-kill every process running inside the given Wine prefix.
+///
+/// # Errors
+/// Returns an error if `wineserver` cannot be spawned.
+pub async fn kill_prefix(runner: &Runner, prefix: &Path) -> anyhow::Result<()> {
+    let status = tokio::process::Command::new(wineserver_bin_path(runner))
+        .arg("--kill")
+        .env("WINEPREFIX", prefix)
+        .status()
+        .await?;
+    tracing::info!(
+        "Killed all processes in {} (wineserver status: {status})",
+        prefix.display()
+    );
+    Ok(())
+}
+
+/// Wait until `WoW` (and everything else in its prefix) has exited.
+///
+/// # Errors
+/// Returns an error if no runner can be resolved or `wineserver` fails.
+pub async fn wait_for_wow_exit(config: &Config) -> anyhow::Result<()> {
+    let runner = get_runner(&config.runner)?;
+    // `wow_prefix_path()` is the outer compat-data dir; for Proton the actual Wine prefix
+    // `wineserver` operates on lives at `<compat_data_path>/pfx`, so we must resolve the real
+    // root or `wineserver --wait` will find nothing there and return immediately.
+    wait_for_prefix_idle(&runner, &config.wow_wine_prefix_root()).await
+}
+
+/// Force-kill `WoW` and everything else running in its prefix.
+///
+/// # Errors
+/// Returns an error if no runner can be resolved or `wineserver` fails.
+pub async fn kill_wow(config: &Config) -> anyhow::Result<()> {
+    let runner = get_runner(&config.runner)?;
+    kill_prefix(&runner, &config.wow_wine_prefix_root()).await
 }

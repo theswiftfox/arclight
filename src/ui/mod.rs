@@ -38,6 +38,21 @@ pub enum Screen {
     Settings,
 }
 
+/// Stages of the `WoW` launch stream task: spawn the process (fast, drives `LaunchResult`), then
+/// wait for the `WoW` Wine prefix to go idle (slow, drives `WowExited`).
+enum LaunchStage {
+    Spawn {
+        config: Config,
+        use_launcherlogin: bool,
+        has_gamemode: bool,
+        log_sender: mpsc::UnboundedSender<logs::LogEntry>,
+    },
+    WaitExit {
+        config: Config,
+    },
+    Done,
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     // Window controls
@@ -51,6 +66,9 @@ pub enum Message {
     // Launch
     Launch,
     LaunchResult(Result<(), String>),
+    WowExited(Result<(), String>),
+    KillWow,
+    KillWowResult(Result<(), String>),
     // Battle.net
     LaunchBnet,
     LaunchBnetResult(Result<(), String>),
@@ -110,6 +128,7 @@ pub struct App {
     config: Config,
     status: String,
     launching: bool,
+    wow_running: bool,
     maximized: bool,
     auth_status: AuthStatus,
     bnet_busy: bool,
@@ -155,6 +174,7 @@ impl App {
             config,
             status: "Ready".into(),
             launching: false,
+            wow_running: false,
             maximized: false,
             auth_status,
             bnet_busy: false,
@@ -251,10 +271,42 @@ impl App {
             Message::LaunchResult(result) => {
                 self.launching = false;
                 match result {
-                    Ok(()) => self.status = "Game launched!".into(),
+                    Ok(()) => {
+                        self.wow_running = true;
+                        self.status = "Game launched!".into();
+                    }
                     Err(e) => self.status = format!("Launch failed: {e}"),
                 }
                 Task::none()
+            }
+            Message::WowExited(result) => {
+                self.wow_running = false;
+                match result {
+                    Ok(()) => self.status = "WoW closed.".into(),
+                    Err(e) => self.status = format!("Lost track of WoW: {e}"),
+                }
+                // Restore the launcher window now that we know the game has actually exited
+                // (rather than just having been launched).
+                let restore_task = if self.config.on_launch == OnLaunchBehavior::Minimize {
+                    self.main_window_id
+                        .map_or_else(Task::none, |id| iced::window::minimize(id, false))
+                } else {
+                    Task::none()
+                };
+                Task::batch([restore_task, self.refresh_auth_task()])
+            }
+            Message::KillWow => {
+                self.status = "Killing WoW...".into();
+                let config = self.config.clone();
+                Task::perform(
+                    async move { launcher::kill_wow(&config).await.map_err(|e| e.to_string()) },
+                    Message::KillWowResult,
+                )
+            }
+            Message::KillWowResult(_result) => {
+                self.wow_running = false;
+                self.status = "WoW killed.".into();
+                self.refresh_auth_task()
             }
             Message::LaunchBnet => self.handle_launch_bnet(),
             Message::LaunchBnetResult(result) => {
@@ -379,14 +431,61 @@ impl App {
 
         let use_launcherlogin = false;
         let has_gamemode = self.gamemode_installed;
-        let launch_task = Task::perform(
-            async move {
-                launcher::launch(&config, use_launcherlogin, has_gamemode, log_sender)
-                    .await
-                    .map_err(|e| e.to_string())
-            },
-            Message::LaunchResult,
-        );
+
+        // If we're keeping the launcher window open, track the game's lifetime: emit
+        // `LaunchResult` as soon as the process is spawned (for immediate feedback), then keep
+        // going and emit `WowExited` once the WoW Wine prefix actually becomes idle.
+        let launch_task = if let Some(log_sender) = log_sender {
+            Task::stream(iced::futures::stream::unfold(
+                LaunchStage::Spawn {
+                    config,
+                    use_launcherlogin,
+                    has_gamemode,
+                    log_sender,
+                },
+                |stage| async move {
+                    match stage {
+                        LaunchStage::Spawn {
+                            config,
+                            use_launcherlogin,
+                            has_gamemode,
+                            log_sender,
+                        } => {
+                            let result = launcher::launch(
+                                &config,
+                                use_launcherlogin,
+                                has_gamemode,
+                                Some(log_sender),
+                            )
+                            .await
+                            .map_err(|e| e.to_string());
+                            let next = if result.is_ok() {
+                                LaunchStage::WaitExit { config }
+                            } else {
+                                LaunchStage::Done
+                            };
+                            Some((Message::LaunchResult(result), next))
+                        }
+                        LaunchStage::WaitExit { config } => {
+                            let result = launcher::wait_for_wow_exit(&config)
+                                .await
+                                .map_err(|e| e.to_string());
+                            Some((Message::WowExited(result), LaunchStage::Done))
+                        }
+                        LaunchStage::Done => None,
+                    }
+                },
+            ))
+        } else {
+            Task::perform(
+                async move {
+                    launcher::launch(&config, use_launcherlogin, has_gamemode, None)
+                        .await
+                        .map_err(|e| e.to_string())
+                },
+                Message::LaunchResult,
+            )
+        };
         let window_task = match on_launch {
             OnLaunchBehavior::Minimize => {
                 if let Some(id) = self.main_window_id {
@@ -714,14 +813,24 @@ impl App {
 
         let status = text(&self.status).size(14);
 
-        let can_play = self.config.game_path.is_some() && !self.launching;
+        let can_play = self.config.game_path.is_some() && !self.launching && !self.wow_running;
 
-        let launch_btn = if can_play {
-            button(text("Play").size(24))
-                .padding([12, 48])
-                .on_press(Message::Launch)
+        let launch_btn = if self.wow_running {
+            row![
+                button(text("WoW is running").size(16)).padding([12, 32]),
+                button("Force Quit")
+                    .padding([12, 24])
+                    .on_press(Message::KillWow),
+            ]
+            .spacing(8)
         } else {
-            button(text("Play").size(24)).padding([12, 48])
+            row![if can_play {
+                button(text("Play").size(24))
+                    .padding([12, 48])
+                    .on_press(Message::Launch)
+            } else {
+                button(text("Play").size(24)).padding([12, 48])
+            }]
         };
 
         let settings_btn = button(

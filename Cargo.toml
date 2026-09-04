@@ -1,6 +1,6 @@
 [package]
 name = "arclight"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A native Linux launcher for World of Warcraft"
 
@@ -14,7 +14,7 @@ tokio = { version = "1", features = ["full"] }
 # Serialization & config
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
+toml = "1.1"
 
 # Filesystem paths
 dirs = "6"
@@ -24,14 +24,14 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # HTTP client (for auth & patching later)
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.13", features = ["json", "stream"] }
 
 # Error handling
 anyhow = "1"
 thiserror = "2"
 
 # Process & system
-which = "7"
+which = "8"
 
 # Clipboard
 arboard = "3"

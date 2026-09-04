@@ -207,10 +207,10 @@ pub async fn launch_bnet(
 
     if let Some(sender) = log_sender {
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let mut child = cmd
+        let child = cmd
             .spawn()
             .map_err(|e| anyhow::anyhow!("Failed to launch Battle.net: {e}"))?;
-        spawn_log_readers(&mut child, sender);
+        spawn_log_readers(child, sender);
     } else {
         let _child = cmd
             .spawn()
@@ -221,42 +221,12 @@ pub async fn launch_bnet(
 
     // The initial Battle.net process exits quickly after spawning the real client.
     // Use wineserver --wait to block until ALL processes in the prefix have exited.
+    //
+    // `prefix` here is the outer compat-data dir; for Proton the actual Wine prefix
+    // `wineserver` operates on lives at `<compat_data_path>/pfx`, so we must resolve the real
+    // root or `wineserver --wait` will find nothing there and return immediately.
     let runner = get_runner(&config.runner)?;
-    let wine_bin = match runner.runner_type {
-        RunnerType::Wine => runner.path.clone(),
-        RunnerType::Proton => {
-            let proton_dir = runner.path.parent().unwrap_or(Path::new("."));
-            let wine = proton_dir.join("dist/bin/wine64");
-            if wine.exists() {
-                wine
-            } else {
-                proton_dir.join("files/bin/wine64")
-            }
-        }
-    };
-
-    let wineserver = wine_bin
-        .parent()
-        .unwrap_or(Path::new("."))
-        .join("wineserver");
-    let wineserver_bin = if wineserver.exists() {
-        wineserver
-    } else {
-        std::path::PathBuf::from("wineserver")
-    };
-
-    let status = Command::new(&wineserver_bin)
-        .arg("--wait")
-        .env("WINEPREFIX", &prefix)
-        .status()
-        .await?;
-
-    tracing::info!(
-        "All prefix processes exited (wineserver status: {})",
-        status
-    );
-
-    Ok(())
+    crate::launcher::wait_for_prefix_idle(&runner, &config.wine_prefix_root()).await
 }
 
 /// Kill all Battle.net processes in the prefix.
@@ -264,44 +234,8 @@ pub async fn launch_bnet(
 /// # Errors
 /// Returns an error if the runner cannot be resolved.
 pub async fn kill_bnet(config: &Config) -> anyhow::Result<()> {
-    let prefix = config.prefix_path();
     let runner = get_runner(&config.runner)?;
-
-    let wine_bin = match runner.runner_type {
-        RunnerType::Wine => runner.path.clone(),
-        RunnerType::Proton => {
-            let proton_dir = runner.path.parent().unwrap_or(Path::new("."));
-            let wine = proton_dir.join("dist/bin/wine64");
-            if wine.exists() {
-                wine
-            } else {
-                proton_dir.join("files/bin/wine64")
-            }
-        }
-    };
-
-    // Use wineserver --kill to terminate all processes in the prefix
-    let wineserver = wine_bin
-        .parent()
-        .unwrap_or(Path::new("."))
-        .join("wineserver");
-    if wineserver.exists() {
-        let _ = Command::new(&wineserver)
-            .arg("--kill")
-            .env("WINEPREFIX", &prefix)
-            .status()
-            .await;
-    } else {
-        // Fallback: try system wineserver
-        let _ = Command::new("wineserver")
-            .arg("--kill")
-            .env("WINEPREFIX", &prefix)
-            .status()
-            .await;
-    }
-
-    tracing::info!("Battle.net killed");
-    Ok(())
+    crate::launcher::kill_prefix(&runner, &config.wine_prefix_root()).await
 }
 
 /// Build a Wine/Proton command with common env vars
@@ -347,18 +281,7 @@ fn build_wine_command(runner: &Runner, prefix: &Path, exe: &Path, config: &Confi
 async fn create_prefix(runner: &Runner, prefix: &Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(prefix)?;
 
-    let wine_bin = match runner.runner_type {
-        RunnerType::Wine => runner.path.clone(),
-        RunnerType::Proton => {
-            let proton_dir = runner.path.parent().unwrap_or(Path::new("."));
-            let wine = proton_dir.join("dist/bin/wine64");
-            if wine.exists() {
-                wine
-            } else {
-                proton_dir.join("files/bin/wine64")
-            }
-        }
-    };
+    let wine_bin = crate::launcher::wine_bin_path(runner);
 
     let status = Command::new(&wine_bin)
         .arg("wineboot")
@@ -375,27 +298,54 @@ async fn create_prefix(runner: &Runner, prefix: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Spawn background tasks that read stdout/stderr from a child process and send log entries.
-fn spawn_log_readers(child: &mut tokio::process::Child, sender: mpsc::UnboundedSender<LogEntry>) {
-    if let Some(stdout) = child.stdout.take() {
-        let tx = sender.clone();
-        tokio::spawn(async move {
-            let reader = BufReader::new(stdout);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let _ = tx.send(LogEntry::new("BNet", line));
+/// Spawn a background task that reads stdout/stderr from a child process and sends log
+/// entries, stopping as soon as the direct child process exits.
+///
+/// We deliberately tie the readers' lifetime to the child's exit rather than to EOF on the
+/// pipes: Wine/Proton keep long-lived helper processes (e.g. `wineserver`) running in the
+/// background for the shared prefix, and those helpers inherit our piped stdout/stderr file
+/// descriptors. If we only stopped on EOF, the reader tasks — and the pipe file descriptors
+/// they hold open — would never be released for the lifetime of the app, leaking two file
+/// descriptors on every launch until the process runs out of them.
+fn spawn_log_readers(mut child: tokio::process::Child, sender: mpsc::UnboundedSender<LogEntry>) {
+    let mut stdout_lines = child.stdout.take().map(|s| BufReader::new(s).lines());
+    let mut stderr_lines = child.stderr.take().map(|s| BufReader::new(s).lines());
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                status = child.wait() => {
+                    if let Err(e) = status {
+                        tracing::warn!("Error waiting for BNet process: {e}");
+                    }
+                    break;
+                }
+                result = read_line(&mut stdout_lines) => {
+                    match result {
+                        Ok(Some(line)) => { let _ = sender.send(LogEntry::new("BNet", line)); }
+                        _ => stdout_lines = None,
+                    }
+                }
+                result = read_line(&mut stderr_lines) => {
+                    match result {
+                        Ok(Some(line)) => { let _ = sender.send(LogEntry::new("BNet", line)); }
+                        _ => stderr_lines = None,
+                    }
+                }
             }
-        });
-    }
-    if let Some(stderr) = child.stderr.take() {
-        let tx = sender;
-        tokio::spawn(async move {
-            let reader = BufReader::new(stderr);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let _ = tx.send(LogEntry::new("BNet", line));
-            }
-        });
+        }
+    });
+}
+
+/// Read the next line from an optional line reader, resolving to a pending future forever if
+/// the reader has already been exhausted (so the corresponding `select!` arm is effectively
+/// disabled without needing separate `if` guards per branch).
+async fn read_line<R: tokio::io::AsyncBufRead + Unpin>(
+    lines: &mut Option<tokio::io::Lines<R>>,
+) -> std::io::Result<Option<String>> {
+    match lines {
+        Some(l) => l.next_line().await,
+        None => std::future::pending().await,
     }
 }
 

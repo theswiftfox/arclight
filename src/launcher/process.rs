@@ -118,7 +118,7 @@ pub async fn launch_game(
 
     if let Some(sender) = log_sender {
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let mut child = cmd.spawn().map_err(|e| {
+        let child = cmd.spawn().map_err(|e| {
             anyhow::anyhow!(
                 "Failed to spawn process (runner: {}): {}",
                 runner.path.display(),
@@ -126,7 +126,7 @@ pub async fn launch_game(
             )
         })?;
         tracing::info!("WoW launched with PID: {:?}", child.id());
-        spawn_log_readers(&mut child, sender, "WoW");
+        spawn_log_readers(child, sender, "WoW");
     } else {
         let child = cmd.spawn().map_err(|e| {
             anyhow::anyhow!(
@@ -198,31 +198,58 @@ fn with_gamemode_cmd(cmd: &Command) -> Command {
     gamemode_cmd
 }
 
-/// Spawn background tasks that read stdout/stderr from a child process and send log entries.
+/// Spawn a background task that reads stdout/stderr from a child process and sends log
+/// entries, stopping as soon as the direct child process exits.
+///
+/// We deliberately tie the readers' lifetime to the child's exit rather than to EOF on the
+/// pipes: Wine/Proton keep long-lived helper processes (e.g. `wineserver`) running in the
+/// background for the shared prefix, and those helpers inherit our piped stdout/stderr file
+/// descriptors. If we only stopped on EOF, the reader tasks — and the pipe file descriptors
+/// they hold open — would never be released for the lifetime of the app, leaking two file
+/// descriptors on every launch until the process runs out of them.
 fn spawn_log_readers(
-    child: &mut tokio::process::Child,
+    mut child: tokio::process::Child,
     sender: mpsc::UnboundedSender<LogEntry>,
     source: &'static str,
 ) {
-    if let Some(stdout) = child.stdout.take() {
-        let tx = sender.clone();
-        tokio::spawn(async move {
-            let reader = BufReader::new(stdout);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let _ = tx.send(LogEntry::new(source, line));
+    let mut stdout_lines = child.stdout.take().map(|s| BufReader::new(s).lines());
+    let mut stderr_lines = child.stderr.take().map(|s| BufReader::new(s).lines());
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                status = child.wait() => {
+                    if let Err(e) = status {
+                        tracing::warn!("Error waiting for {source} process: {e}");
+                    }
+                    break;
+                }
+                result = read_line(&mut stdout_lines) => {
+                    match result {
+                        Ok(Some(line)) => { let _ = sender.send(LogEntry::new(source, line)); }
+                        _ => stdout_lines = None,
+                    }
+                }
+                result = read_line(&mut stderr_lines) => {
+                    match result {
+                        Ok(Some(line)) => { let _ = sender.send(LogEntry::new(source, line)); }
+                        _ => stderr_lines = None,
+                    }
+                }
             }
-        });
-    }
-    if let Some(stderr) = child.stderr.take() {
-        let tx = sender;
-        tokio::spawn(async move {
-            let reader = BufReader::new(stderr);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let _ = tx.send(LogEntry::new(source, line));
-            }
-        });
+        }
+    });
+}
+
+/// Read the next line from an optional line reader, resolving to a pending future forever if
+/// the reader has already been exhausted (so the corresponding `select!` arm is effectively
+/// disabled without needing separate `if` guards per branch).
+async fn read_line<R: tokio::io::AsyncBufRead + Unpin>(
+    lines: &mut Option<tokio::io::Lines<R>>,
+) -> std::io::Result<Option<String>> {
+    match lines {
+        Some(l) => l.next_line().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -230,18 +257,7 @@ fn spawn_log_readers(
 async fn create_prefix(runner: &Runner, prefix: &Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(prefix)?;
 
-    let wine_bin = match runner.runner_type {
-        RunnerType::Wine => runner.path.clone(),
-        RunnerType::Proton => {
-            let proton_dir = runner.path.parent().unwrap_or(Path::new("."));
-            let wine = proton_dir.join("dist/bin/wine64");
-            if wine.exists() {
-                wine
-            } else {
-                proton_dir.join("files/bin/wine64")
-            }
-        }
-    };
+    let wine_bin = super::wine_bin_path(runner);
 
     let status = Command::new(&wine_bin)
         .arg("wineboot")
