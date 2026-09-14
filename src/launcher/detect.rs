@@ -1,6 +1,9 @@
-use std::{fmt, path::PathBuf};
+use std::{
+    fmt,
+    path::{Path, PathBuf},
+};
 
-use super::Runner;
+use super::{Runner, steam};
 use crate::config::RunnerType;
 
 /// A detected runner for use in UI (implements Display for `pick_list`)
@@ -91,6 +94,11 @@ pub fn detect_runners() -> Vec<DetectedRunner> {
         }
     }
 
+    // Official Proton versions are installed into each Steam library's common directory.
+    for library in steam::library_dirs() {
+        collect_proton_runners(&mut runners, &library.join("steamapps/common"), "Steam ");
+    }
+
     // Lutris runners
     let lutris_wine = home.join(".local/share/lutris/runners/wine");
     if lutris_wine.is_dir()
@@ -121,10 +129,33 @@ pub fn detect_runners() -> Vec<DetectedRunner> {
                 RunnerType::Wine => 2,
             }
         };
-        score(a).cmp(&score(b))
+        score(a).cmp(&score(b)).then_with(|| a.name.cmp(&b.name))
     });
+    runners.dedup_by(|a, b| same_path(&a.path, &b.path));
 
     runners
+}
+
+fn collect_proton_runners(runners: &mut Vec<DetectedRunner>, directory: &Path, prefix: &str) {
+    if let Ok(entries) = std::fs::read_dir(directory) {
+        for entry in entries.flatten() {
+            let path = entry.path().join("proton");
+            if path.is_file() {
+                runners.push(DetectedRunner {
+                    name: format!("{prefix}{}", entry.file_name().to_string_lossy()),
+                    path,
+                    runner_type: RunnerType::Proton,
+                });
+            }
+        }
+    }
+}
+
+fn same_path(first: &Path, second: &Path) -> bool {
+    first.canonicalize().unwrap_or_else(|_| first.to_path_buf())
+        == second
+            .canonicalize()
+            .unwrap_or_else(|_| second.to_path_buf())
 }
 
 /// Find the best available runner (prefer Proton-GE, then system Wine).

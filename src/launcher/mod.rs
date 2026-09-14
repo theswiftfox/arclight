@@ -1,6 +1,7 @@
 pub mod bnet;
 pub mod detect;
 pub mod process;
+pub mod steam;
 
 use std::{
     path::{Path, PathBuf},
@@ -10,7 +11,7 @@ use std::{
 use tokio::sync::mpsc;
 
 use crate::{
-    config::{Config, RunnerConfig, RunnerType},
+    config::{Config, RunnerConfig, RunnerOverride, RunnerType},
     ui::logs::LogEntry,
 };
 
@@ -28,17 +29,37 @@ pub struct Runner {
 /// Returns an error if no runner is configured and auto-detection fails.
 pub fn get_runner(config: &RunnerConfig) -> anyhow::Result<Runner> {
     if let Some(ref binary) = config.binary {
-        Ok(Runner {
-            name: binary
-                .file_name()
-                .map_or_else(|| "custom".into(), |n| n.to_string_lossy().to_string()),
-            path: binary.clone(),
-            runner_type: config.runner_type,
-        })
+        Ok(configured_runner(binary, config.runner_type))
     } else {
         // Auto-detect
         detect::find_best_runner()
     }
+}
+
+/// Get Battle.net's runner, falling back to the configured `WoW` runner.
+///
+/// # Errors
+/// Returns an error if neither the Battle.net override nor the `WoW` runner can be resolved.
+pub fn get_bnet_runner(config: &RunnerConfig) -> anyhow::Result<Runner> {
+    if let Some(override_runner) = &config.bnet_runner {
+        Ok(configured_override_runner(override_runner))
+    } else {
+        get_runner(config)
+    }
+}
+
+fn configured_runner(binary: &Path, runner_type: RunnerType) -> Runner {
+    Runner {
+        name: binary
+            .file_name()
+            .map_or_else(|| "custom".into(), |n| n.to_string_lossy().to_string()),
+        path: binary.to_path_buf(),
+        runner_type,
+    }
+}
+
+fn configured_override_runner(override_runner: &RunnerOverride) -> Runner {
+    configured_runner(&override_runner.binary, override_runner.runner_type)
 }
 
 /// Launch `WoW` with the given config.
@@ -211,4 +232,43 @@ pub async fn wait_for_wow_exit(config: &Config) -> anyhow::Result<()> {
 pub async fn kill_wow(config: &Config) -> anyhow::Result<()> {
     let runner = get_runner(&config.runner)?;
     kill_prefix(&runner, &config.wow_wine_prefix_root()).await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    #[test]
+    fn bnet_runner_falls_back_to_wow_runner() {
+        let config = RunnerConfig {
+            binary: Some(PathBuf::from("/opt/proton-wow/proton")),
+            runner_type: RunnerType::Proton,
+            ..RunnerConfig::default()
+        };
+
+        let runner = get_bnet_runner(&config).unwrap();
+
+        assert_eq!(runner.path, PathBuf::from("/opt/proton-wow/proton"));
+        assert_eq!(runner.runner_type, RunnerType::Proton);
+    }
+
+    #[test]
+    fn bnet_runner_uses_configured_override() {
+        let config = RunnerConfig {
+            binary: Some(PathBuf::from("/usr/bin/wine")),
+            runner_type: RunnerType::Wine,
+            bnet_runner: Some(RunnerOverride {
+                binary: PathBuf::from("/opt/proton-bnet/proton"),
+                runner_type: RunnerType::Proton,
+            }),
+            ..RunnerConfig::default()
+        };
+
+        let runner = get_bnet_runner(&config).unwrap();
+
+        assert_eq!(runner.path, PathBuf::from("/opt/proton-bnet/proton"));
+        assert_eq!(runner.runner_type, RunnerType::Proton);
+    }
 }

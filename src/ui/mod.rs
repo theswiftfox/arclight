@@ -11,7 +11,7 @@ use iced::{
 use tokio::sync::mpsc;
 
 use crate::{
-    config::{Config, OnLaunchBehavior},
+    config::{Config, OnLaunchBehavior, RunnerOverride, RunnerType},
     launcher,
     launcher::{
         bnet::{self, AuthStatus},
@@ -81,6 +81,8 @@ pub enum Message {
     // Settings
     GamePathChanged(String),
     RunnerSelected(DetectedRunner),
+    BnetRunnerSelected(DetectedRunner),
+    BnetRunnerReset,
     OnLaunchChanged(OnLaunchBehavior),
     // WoW settings
     WowArgsChanged(String),
@@ -134,6 +136,7 @@ pub struct App {
     bnet_busy: bool,
     detected_runners: Vec<DetectedRunner>,
     selected_runner: Option<DetectedRunner>,
+    selected_bnet_runner: Option<DetectedRunner>,
     // Settings state
     game_path_input: String,
     wow_args_input: String,
@@ -180,6 +183,7 @@ impl App {
             bnet_busy: false,
             detected_runners: Vec::new(),
             selected_runner: None,
+            selected_bnet_runner: None,
             game_path_input,
             wow_args_input,
             wow_env_vars,
@@ -365,9 +369,13 @@ impl App {
                 self.refresh_auth_task()
             }
             Message::RunnersDetected(runners) => {
-                if let Some(ref binary) = self.config.runner.binary {
-                    self.selected_runner = runners.iter().find(|r| &r.path == binary).cloned();
-                }
+                let mut runners = runners;
+                self.selected_runner = self.config.runner.binary.as_ref().map(|binary| {
+                    configured_runner(&mut runners, binary, self.config.runner.runner_type)
+                });
+                self.selected_bnet_runner = self.config.runner.bnet_runner.as_ref().map(|runner| {
+                    configured_runner(&mut runners, &runner.binary, runner.runner_type)
+                });
                 self.detected_runners = runners;
                 Task::none()
             }
@@ -577,6 +585,17 @@ impl App {
                 self.config.runner.binary = Some(runner.path.clone());
                 self.config.runner.runner_type = runner.runner_type;
                 self.selected_runner = Some(runner);
+            }
+            Message::BnetRunnerSelected(runner) => {
+                self.config.runner.bnet_runner = Some(RunnerOverride {
+                    binary: runner.path.clone(),
+                    runner_type: runner.runner_type,
+                });
+                self.selected_bnet_runner = Some(runner);
+            }
+            Message::BnetRunnerReset => {
+                self.config.runner.bnet_runner = None;
+                self.selected_bnet_runner = None;
             }
             Message::OnLaunchChanged(behavior) => self.config.on_launch = behavior,
             Message::WowArgsChanged(args) => self.wow_args_input = args,
@@ -845,8 +864,12 @@ impl App {
             .padding([8, 20])
             .on_press(Message::OpenLogs);
 
-        let runner_info = if let Some(ref runner) = self.selected_runner {
-            text(format!("Runner: {}", runner.name)).size(12)
+        let runner_info = if self.config.runner.binary.is_some() {
+            let name = self.selected_runner.as_ref().map_or_else(
+                || "Configured runner".to_string(),
+                |runner| runner.name.clone(),
+            );
+            text(format!("Runner: {name}")).size(12)
         } else if let Ok(runner) = launcher::get_runner(&self.config.runner) {
             text(format!("Runner: {} (auto)", runner.name)).size(12)
         } else {
@@ -1033,6 +1056,23 @@ impl App {
             text("Status: Not installed").size(12)
         };
 
+        let bnet_runner_label = text("Runner:").size(14);
+        let bnet_runner_picker = pick_list(
+            self.detected_runners.clone(),
+            self.selected_bnet_runner.clone(),
+            Message::BnetRunnerSelected,
+        )
+        .placeholder("Use WoW runner")
+        .padding(8)
+        .width(Length::Fill);
+        let bnet_runner_reset = if self.selected_bnet_runner.is_some() {
+            button("Use WoW runner")
+                .padding([6, 12])
+                .on_press(Message::BnetRunnerReset)
+        } else {
+            button("Using WoW runner").padding([6, 12])
+        };
+
         let bnet_args_label = text("Launch args:").size(14);
         let bnet_args_field = text_input("e.g. --in-process-gpu", &self.bnet_args_input)
             .on_input(Message::BnetArgsChanged)
@@ -1113,6 +1153,9 @@ impl App {
             // Battle.net section
             .push(bnet_header)
             .push(bnet_status)
+            .push(bnet_runner_label)
+            .push(bnet_runner_picker)
+            .push(bnet_runner_reset)
             .push(bnet_args_label)
             .push(bnet_args_field)
             .push(bnet_env_label)
@@ -1131,6 +1174,81 @@ impl App {
     }
 }
 
+fn configured_runner(
+    runners: &mut Vec<DetectedRunner>,
+    binary: &std::path::Path,
+    runner_type: RunnerType,
+) -> DetectedRunner {
+    if let Some(runner) = runners
+        .iter()
+        .find(|runner| same_path(&runner.path, binary))
+    {
+        return runner.clone();
+    }
+
+    let runner = DetectedRunner {
+        name: format!("Configured (not found): {}", binary.display()),
+        path: binary.to_path_buf(),
+        runner_type,
+    };
+    runners.push(runner.clone());
+    runner
+}
+
+fn same_path(first: &std::path::Path, second: &std::path::Path) -> bool {
+    first.canonicalize().unwrap_or_else(|_| first.to_path_buf())
+        == second
+            .canonicalize()
+            .unwrap_or_else(|_| second.to_path_buf())
+}
+
 fn detect_runners_async() -> Vec<DetectedRunner> {
     launcher::detect::detect_runners()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    fn runner(name: &str, path: &str) -> DetectedRunner {
+        DetectedRunner {
+            name: name.to_string(),
+            path: PathBuf::from(path),
+            runner_type: RunnerType::Proton,
+        }
+    }
+
+    #[test]
+    fn configured_runner_uses_matching_detected_runner() {
+        let mut runners = vec![runner("Steam Proton 10.0", "/opt/proton/proton")];
+
+        let selected = configured_runner(
+            &mut runners,
+            &PathBuf::from("/opt/proton/proton"),
+            RunnerType::Proton,
+        );
+
+        assert_eq!(selected.name, "Steam Proton 10.0");
+        assert_eq!(runners.len(), 1);
+    }
+
+    #[test]
+    fn configured_runner_is_retained_when_not_detected() {
+        let mut runners = vec![runner("Steam Proton 10.0", "/opt/proton-10/proton")];
+
+        let selected = configured_runner(
+            &mut runners,
+            &PathBuf::from("/opt/proton-9/proton"),
+            RunnerType::Proton,
+        );
+
+        assert_eq!(
+            selected.name,
+            "Configured (not found): /opt/proton-9/proton"
+        );
+        assert_eq!(selected.path, PathBuf::from("/opt/proton-9/proton"));
+        assert_eq!(runners.len(), 2);
+    }
 }

@@ -65,6 +65,8 @@ pub struct Config {
 pub struct RunnerConfig {
     /// Path to wine/proton binary (None = auto-detect)
     pub binary: Option<PathBuf>,
+    /// Optional Wine/Proton runner override for Battle.net (None = use the `WoW` runner)
+    pub bnet_runner: Option<RunnerOverride>,
     /// Wine prefix path for Battle.net (None = use default)
     pub prefix: Option<PathBuf>,
     /// Wine prefix path for `WoW` (None = use default, separate from Battle.net prefix)
@@ -77,6 +79,15 @@ pub struct RunnerConfig {
     pub esync: bool,
     /// Enable fsync
     pub fsync: bool,
+}
+
+/// A specific Wine/Proton runner selection for one application.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunnerOverride {
+    /// Path to the Wine or Proton executable
+    pub binary: PathBuf,
+    /// Type of executable at `binary`
+    pub runner_type: RunnerType,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,6 +160,7 @@ impl Default for RunnerConfig {
     fn default() -> Self {
         Self {
             binary: None,
+            bnet_runner: None,
             prefix: None,
             wow_prefix: None,
             runner_type: RunnerType::Wine,

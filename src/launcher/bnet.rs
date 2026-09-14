@@ -8,7 +8,7 @@ use tokio::{
 
 use crate::{
     config::{AppPaths, Config, RunnerType},
-    launcher::{Runner, get_runner},
+    launcher::{Runner, get_bnet_runner},
     ui::logs::LogEntry,
 };
 
@@ -142,7 +142,7 @@ pub async fn download_installer(target_path: &Path) -> anyhow::Result<()> {
 /// Returns an error if prefix creation, installer download, or the installer process fails.
 pub async fn install_bnet(config: &Config, installer_path: Option<&Path>) -> anyhow::Result<()> {
     let prefix = config.prefix_path();
-    let runner = get_runner(&config.runner)?;
+    let runner = get_bnet_runner(&config.runner)?;
 
     // Ensure prefix exists
     if !prefix.exists() {
@@ -189,7 +189,7 @@ pub async fn launch_bnet(
     }
 
     let prefix = config.prefix_path();
-    let runner = get_runner(&config.runner)?;
+    let runner = get_bnet_runner(&config.runner)?;
 
     tracing::info!("Launching Battle.net...");
 
@@ -225,7 +225,7 @@ pub async fn launch_bnet(
     // `prefix` here is the outer compat-data dir; for Proton the actual Wine prefix
     // `wineserver` operates on lives at `<compat_data_path>/pfx`, so we must resolve the real
     // root or `wineserver --wait` will find nothing there and return immediately.
-    let runner = get_runner(&config.runner)?;
+    let runner = get_bnet_runner(&config.runner)?;
     crate::launcher::wait_for_prefix_idle(&runner, &config.wine_prefix_root()).await
 }
 
@@ -234,7 +234,7 @@ pub async fn launch_bnet(
 /// # Errors
 /// Returns an error if the runner cannot be resolved.
 pub async fn kill_bnet(config: &Config) -> anyhow::Result<()> {
-    let runner = get_runner(&config.runner)?;
+    let runner = get_bnet_runner(&config.runner)?;
     crate::launcher::kill_prefix(&runner, &config.wine_prefix_root()).await
 }
 
