@@ -3,13 +3,13 @@ use std::{path::Path, process::Stdio};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::Command,
-    sync::mpsc,
 };
 
 use super::Runner;
 use crate::{
-    config::{Config, RunnerType},
-    ui::logs::LogEntry,
+    background::{self, IO_TIMEOUT},
+    config::{Config, GameClient, RunnerType},
+    ui::logs::{LogEntry, LogSender, MAX_LINE_BYTES},
 };
 
 /// Launch the game using the specified runner.
@@ -20,18 +20,75 @@ pub async fn launch_game(
     runner: &Runner,
     wow_exe: &Path,
     config: &Config,
+    client: &GameClient,
     use_launcherlogin: bool,
     gamemode_available: bool,
-    log_sender: Option<mpsc::UnboundedSender<LogEntry>>,
+    log_sender: Option<LogSender>,
 ) -> anyhow::Result<()> {
-    let prefix = config.wow_prefix_path();
+    let probe_config = config.clone();
+    let probe_client = client.clone();
+    let runner_type = runner.runner_type;
+    let (prefix, exists) = background::blocking("Checking WoW prefix", IO_TIMEOUT, move || {
+        let prefix = probe_client.prefix_path();
+        let exists = probe_config
+            .game_wine_prefix_root(&probe_client, runner_type)
+            .join("drive_c")
+            .is_dir();
+        Ok((prefix, exists))
+    })
+    .await?;
 
     // Ensure prefix exists
-    if !prefix.exists() {
+    if !exists {
         tracing::info!("Creating Wine prefix at {}", prefix.display());
-        create_prefix(runner, &prefix).await?;
+        super::create_prefix(runner, &prefix, "Initializing game prefix").await?;
+    }
+    background::apply_drive_mappings(config.clone()).await?;
+
+    let runner = runner.clone();
+    let wow_exe = wow_exe.to_path_buf();
+    let config = config.clone();
+    let client = client.clone();
+    let client_name = client.name.clone();
+    let mut cmd = background::blocking("Building WoW command", IO_TIMEOUT, move || {
+        Ok(build_game_command(
+            &runner,
+            &wow_exe,
+            &prefix,
+            &config,
+            &client,
+            use_launcherlogin,
+            gamemode_available,
+        ))
+    })
+    .await?;
+
+    if let Some(sender) = log_sender {
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let child = background::spawn_game(cmd).await?;
+        tracing::info!("{} launched with PID: {:?}", client_name, child.id());
+        spawn_log_readers(child, sender, "WoW");
+    } else {
+        // Accepted games survive launcher shutdown; late spawns are cleaned up.
+        let mut child = background::spawn_game(cmd).await?;
+        tracing::info!("{} launched with PID: {:?}", client_name, child.id());
+        tokio::spawn(async move {
+            let _ = child.wait().await;
+        });
     }
 
+    Ok(())
+}
+
+fn build_game_command(
+    runner: &Runner,
+    wow_exe: &Path,
+    prefix: &Path,
+    config: &Config,
+    client: &GameClient,
+    use_launcherlogin: bool,
+    gamemode_available: bool,
+) -> Command {
     let mut cmd = match runner.runner_type {
         RunnerType::Wine => {
             let mut cmd = Command::new(&runner.path);
@@ -45,100 +102,50 @@ pub async fn launch_game(
         }
     };
 
-    // Default args: -launcherlogin -uid wow (only if ACCOUNT blob exists in registry)
-    if use_launcherlogin && !config.wow_skip_default_args {
-        cmd.arg("-launcherlogin");
-        cmd.arg("-uid");
-        cmd.arg("wow");
+    if use_launcherlogin && !client.skip_default_args {
+        cmd.args(["-launcherlogin", "-uid", "wow"]);
     }
+    cmd.args(&client.args).env("WINEPREFIX", prefix);
 
-    // Custom WoW args
-    for arg in &config.wow_args {
-        cmd.arg(arg);
-    }
-
-    // Set Wine prefix
-    cmd.env("WINEPREFIX", &prefix);
-
-    // Proton-specific env vars
     if runner.runner_type == RunnerType::Proton {
-        cmd.env("STEAM_COMPAT_DATA_PATH", &prefix);
-        cmd.env(
+        cmd.env("STEAM_COMPAT_DATA_PATH", prefix).env(
             "STEAM_COMPAT_CLIENT_INSTALL_PATH",
             dirs::home_dir().unwrap_or_default().join(".steam/steam"),
         );
     }
-
-    // Esync/Fsync
     if config.runner.esync {
         cmd.env("WINEESYNC", "1");
     }
     if config.runner.fsync {
         cmd.env("WINEFSYNC", "1");
     }
-
-    // DXVK (for Proton it's usually built-in)
     if config.runner.dxvk && runner.runner_type == RunnerType::Wine {
         cmd.env("WINEDLLOVERRIDES", "d3d11,dxgi=n,b");
     }
-
-    // WoW-specific env vars
-    for (key, value) in &config.wow_env_vars {
+    for (key, value) in &client.env_vars {
         cmd.env(key, value);
     }
-
-    // MangoHud
     if config.mangohud_enabled {
         cmd.env("MANGOHUD", "1");
         if !config.mangohud_config.is_empty() {
             cmd.env("MANGOHUD_CONFIG", &config.mangohud_config);
         }
     }
-
-    // Set working directory to game dir
     if let Some(parent) = wow_exe.parent() {
         cmd.current_dir(parent);
     }
 
-    tracing::info!("Launching WoW: {:?}", cmd);
-
-    // If gamescope is enabled, wrap the entire command
+    tracing::info!("Launching {}: {:?}", client.name, cmd);
     let cmd = if config.gamescope_enabled {
         with_gamescope_cmd(&cmd, config)
     } else {
         cmd
     };
-
-    // If gamemode is enabled, wrap as outermost layer
-    let mut cmd = if config.gamemode_enabled && gamemode_available {
+    if config.gamemode_enabled && gamemode_available {
         with_gamemode_cmd(&cmd)
     } else {
         cmd
-    };
-
-    if let Some(sender) = log_sender {
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let child = cmd.spawn().map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to spawn process (runner: {}): {}",
-                runner.path.display(),
-                e
-            )
-        })?;
-        tracing::info!("WoW launched with PID: {:?}", child.id());
-        spawn_log_readers(child, sender, "WoW");
-    } else {
-        let child = cmd.spawn().map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to spawn process (runner: {}): {}",
-                runner.path.display(),
-                e
-            )
-        })?;
-        tracing::info!("WoW launched with PID: {:?}", child.id());
     }
-
-    Ok(())
 }
 
 /// wrap the command in a gamescope command, preserving args and env vars
@@ -207,13 +214,13 @@ fn with_gamemode_cmd(cmd: &Command) -> Command {
 /// descriptors. If we only stopped on EOF, the reader tasks — and the pipe file descriptors
 /// they hold open — would never be released for the lifetime of the app, leaking two file
 /// descriptors on every launch until the process runs out of them.
-fn spawn_log_readers(
+pub(crate) fn spawn_log_readers(
     mut child: tokio::process::Child,
-    sender: mpsc::UnboundedSender<LogEntry>,
+    sender: LogSender,
     source: &'static str,
 ) {
-    let mut stdout_lines = child.stdout.take().map(|s| BufReader::new(s).lines());
-    let mut stderr_lines = child.stderr.take().map(|s| BufReader::new(s).lines());
+    let mut stdout_lines = child.stdout.take().map(BoundedLines::new);
+    let mut stderr_lines = child.stderr.take().map(BoundedLines::new);
 
     tokio::spawn(async move {
         loop {
@@ -226,13 +233,13 @@ fn spawn_log_readers(
                 }
                 result = read_line(&mut stdout_lines) => {
                     match result {
-                        Ok(Some(line)) => { let _ = sender.send(LogEntry::new(source, line)); }
+                        Ok(Some(line)) => sender.send(LogEntry::new(source, line)),
                         _ => stdout_lines = None,
                     }
                 }
                 result = read_line(&mut stderr_lines) => {
                     match result {
-                        Ok(Some(line)) => { let _ = sender.send(LogEntry::new(source, line)); }
+                        Ok(Some(line)) => sender.send(LogEntry::new(source, line)),
                         _ => stderr_lines = None,
                     }
                 }
@@ -244,8 +251,8 @@ fn spawn_log_readers(
 /// Read the next line from an optional line reader, resolving to a pending future forever if
 /// the reader has already been exhausted (so the corresponding `select!` arm is effectively
 /// disabled without needing separate `if` guards per branch).
-async fn read_line<R: tokio::io::AsyncBufRead + Unpin>(
-    lines: &mut Option<tokio::io::Lines<R>>,
+async fn read_line<R: tokio::io::AsyncRead + Unpin>(
+    lines: &mut Option<BoundedLines<R>>,
 ) -> std::io::Result<Option<String>> {
     match lines {
         Some(l) => l.next_line().await,
@@ -253,23 +260,99 @@ async fn read_line<R: tokio::io::AsyncBufRead + Unpin>(
     }
 }
 
-/// Create a new Wine prefix
-async fn create_prefix(runner: &Runner, prefix: &Path) -> anyhow::Result<()> {
-    std::fs::create_dir_all(prefix)?;
+/// Cancellation-safe line reader that drains oversized lines without retaining them.
+struct BoundedLines<R> {
+    reader: BufReader<R>,
+    line: Vec<u8>,
+    truncated: bool,
+}
 
-    let wine_bin = super::wine_bin_path(runner);
-
-    let status = Command::new(&wine_bin)
-        .arg("wineboot")
-        .arg("--init")
-        .env("WINEPREFIX", prefix)
-        .env("WINEARCH", "win64")
-        .status()
-        .await?;
-
-    if !status.success() {
-        anyhow::bail!("Failed to create Wine prefix");
+impl<R: tokio::io::AsyncRead + Unpin> BoundedLines<R> {
+    fn new(reader: R) -> Self {
+        Self {
+            reader: BufReader::new(reader),
+            line: Vec::new(),
+            truncated: false,
+        }
     }
 
-    Ok(())
+    async fn next_line(&mut self) -> std::io::Result<Option<String>> {
+        loop {
+            let bytes = self.reader.fill_buf().await?;
+            if bytes.is_empty() {
+                return if self.line.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(self.finish()))
+                };
+            }
+            let newline = bytes.iter().position(|&b| b == b'\n');
+            let length = newline.unwrap_or(bytes.len());
+            let retained = length.min(MAX_LINE_BYTES.saturating_sub(self.line.len()));
+            self.line.extend_from_slice(&bytes[..retained]);
+            self.truncated |= retained < length;
+            self.reader.consume(length + usize::from(newline.is_some()));
+            if newline.is_some() {
+                return Ok(Some(self.finish()));
+            }
+            // Even a producer with a continuously readable, newline-free pipe
+            // must let the child-exit arm and other runtime tasks run.
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn finish(&mut self) -> String {
+        let mut text = String::from_utf8_lossy(&self.line)
+            .trim_end_matches('\r')
+            .to_string();
+        if self.truncated {
+            text.push_str(" [truncated]");
+        }
+        self.line.clear();
+        self.truncated = false;
+        text
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::AsyncWriteExt;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn oversized_pipe_line_is_drained_and_following_line_survives() {
+        let (mut writer, reader) = tokio::io::duplex(128);
+        let producer = tokio::spawn(async move {
+            writer
+                .write_all(&vec![b'x'; MAX_LINE_BYTES * 4])
+                .await
+                .unwrap();
+            writer.write_all(b"\nok\n").await.unwrap();
+        });
+        let mut lines = BoundedLines::new(reader);
+        let line = lines.next_line().await.unwrap().unwrap();
+        assert!(line.ends_with("[truncated]"));
+        assert!(line.len() < MAX_LINE_BYTES + 32);
+        assert_eq!(lines.next_line().await.unwrap().as_deref(), Some("ok"));
+        producer.await.unwrap();
+        assert!(lines.next_line().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelling_partial_read_does_not_lose_bytes() {
+        let (mut writer, reader) = tokio::io::duplex(128);
+        writer.write_all(b"partial").await.unwrap();
+        let mut lines = BoundedLines::new(reader);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), lines.next_line())
+                .await
+                .is_err()
+        );
+        writer.write_all(b" line\n").await.unwrap();
+        assert_eq!(
+            lines.next_line().await.unwrap().as_deref(),
+            Some("partial line")
+        );
+    }
 }

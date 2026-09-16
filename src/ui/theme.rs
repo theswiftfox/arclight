@@ -21,6 +21,7 @@ pub fn wow_theme() -> Theme {
             text: Color::from_rgb(0.878, 0.847, 0.784),       // #e0d8c8
             primary: Color::from_rgb(0.0, 0.439, 0.867),      // #0070dd
             success: COLOR_SUCCESS,
+            warning: Color::from_rgb(1.0, 0.8, 0.2),
             danger: COLOR_DANGER,
         },
     )

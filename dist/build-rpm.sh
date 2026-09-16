@@ -2,7 +2,7 @@
 set -euo pipefail
 
 NAME="arclight"
-VERSION="0.1.2"
+VERSION="0.2.0"
 RELEASE="1"
 TOPDIR="$(pwd)/rpmbuild"
 
@@ -19,11 +19,11 @@ tar czf "$TOPDIR/SOURCES/${NAME}-${VERSION}.tar.gz" \
 echo "> Writing spec file..."
 cat > "$TOPDIR/SPECS/${NAME}.spec" << 'SPEC'
 Name:           arclight
-Version:        0.1.2
+Version:        0.2.0
 Release:        1%{?dist}
 Summary:        Native Linux launcher for World of Warcraft
 License:        MIT
-URL:            https://github.com/anomalyco/arclight
+URL:            https://github.com/theswiftfox/arclight
 Source0:        %{name}-%{version}.tar.gz
 
 BuildRequires:  gcc

@@ -1,15 +1,12 @@
 use std::{path::Path, process::Stdio};
 
-use tokio::{
-    io::{AsyncBufReadExt, BufReader},
-    process::Command,
-    sync::mpsc,
-};
+use tokio::process::Command;
 
 use crate::{
+    background::{self, DISCOVERY_TIMEOUT, IO_TIMEOUT, SETUP_TIMEOUT},
     config::{AppPaths, Config, RunnerType},
-    launcher::{Runner, get_bnet_runner},
-    ui::logs::LogEntry,
+    launcher::{Runner, create_prefix, get_bnet_runner},
+    ui::logs::LogSender,
 };
 
 const BNET_INSTALLER_URL: &str = "https://www.battle.net/download/getInstallerForGame?os=win&version=LIVE&gameProgram=BATTLENET_APP";
@@ -111,10 +108,15 @@ fn parse_auth_from_registry(content: &str) -> AuthStatus {
 pub async fn download_installer(target_path: &Path) -> anyhow::Result<()> {
     tracing::info!("Downloading Battle.net installer...");
 
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .user_agent("Arclight/0.1")
-        .build()?;
+    let client = background::blocking("Preparing download", IO_TIMEOUT, || {
+        Ok(reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .timeout(SETUP_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::limited(10))
+            .user_agent("Arclight/0.1")
+            .build()?)
+    })
+    .await?;
 
     let response = client.get(BNET_INSTALLER_URL).send().await?;
     if !response.status().is_success() {
@@ -123,15 +125,21 @@ pub async fn download_installer(target_path: &Path) -> anyhow::Result<()> {
 
     let bytes = response.bytes().await?;
 
-    if let Some(parent) = target_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(target_path, &bytes)?;
+    let length = bytes.len();
+    let target = target_path.to_path_buf();
+    background::mutation("Writing installer", move || {
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(target, &bytes)?;
+        Ok(())
+    })
+    .await?;
 
     tracing::info!(
         "Installer downloaded to {} ({} bytes)",
         target_path.display(),
-        bytes.len()
+        length
     );
     Ok(())
 }
@@ -141,28 +149,50 @@ pub async fn download_installer(target_path: &Path) -> anyhow::Result<()> {
 /// # Errors
 /// Returns an error if prefix creation, installer download, or the installer process fails.
 pub async fn install_bnet(config: &Config, installer_path: Option<&Path>) -> anyhow::Result<()> {
-    let prefix = config.prefix_path();
-    let runner = get_bnet_runner(&config.runner)?;
+    let _setup = background::prefix_setup()?;
+    let probe_config = config.clone();
+    let (prefix, runner, exists, download_path) = background::blocking(
+        "Preparing Battle.net install",
+        DISCOVERY_TIMEOUT,
+        move || {
+            let prefix = probe_config.prefix_path();
+            let exists = probe_config.wine_prefix_root().join("drive_c").is_dir();
+            Ok((
+                prefix,
+                get_bnet_runner(&probe_config.runner)?,
+                exists,
+                AppPaths::data_dir().join("Battle.net-Setup.exe"),
+            ))
+        },
+    )
+    .await?;
 
     // Ensure prefix exists
-    if !prefix.exists() {
+    if !exists {
         tracing::info!("Creating Wine prefix at {}", prefix.display());
-        create_prefix(&runner, &prefix).await?;
+        create_prefix(&runner, &prefix, "Initializing Battle.net prefix").await?;
     }
+    background::apply_drive_mappings(config.clone()).await?;
 
     // Download installer if no path provided
     let installer = if let Some(path) = installer_path {
         path.to_path_buf()
     } else {
-        let dl_path = AppPaths::data_dir().join("Battle.net-Setup.exe");
+        let dl_path = download_path;
         download_installer(&dl_path).await?;
         dl_path
     };
 
     tracing::info!("Running Battle.net installer...");
 
-    let mut cmd = build_wine_command(&runner, &prefix, &installer, config);
-    let status = cmd.status().await?;
+    let config = config.clone();
+    let cmd = background::blocking("Building installer command", IO_TIMEOUT, move || {
+        Ok(build_wine_command(&runner, &prefix, &installer, &config))
+    })
+    .await?;
+    let mut child = background::spawn(cmd).await?;
+    // Interactive installation is intentionally long-lived, on an async worker.
+    let status = child.wait().await?;
 
     if !status.success() {
         anyhow::bail!("Battle.net installer exited with status: {status}");
@@ -172,51 +202,66 @@ pub async fn install_bnet(config: &Config, installer_path: Option<&Path>) -> any
     Ok(())
 }
 
-/// Launch Battle.net client and wait for it to exit.
+/// Launch Battle.net client, returning as soon as it has spawned.
 ///
 /// # Errors
 /// Returns an error if Battle.net is not installed, the runner cannot be resolved, or the process fails to spawn.
-pub async fn launch_bnet(
-    config: &Config,
-    log_sender: Option<mpsc::UnboundedSender<LogEntry>>,
-) -> anyhow::Result<()> {
-    let bnet_exe = config.bnet_exe_path();
-    if !bnet_exe.exists() {
-        anyhow::bail!(
-            "Battle.net not found at {}. Please install it first.",
-            bnet_exe.display()
-        );
-    }
+pub async fn launch_bnet(config: &Config, log_sender: Option<LogSender>) -> anyhow::Result<()> {
+    let _setup = background::prefix_setup()?;
+    background::apply_drive_mappings(config.clone()).await?;
+    let config = config.clone();
+    let mut cmd = background::blocking(
+        "Preparing Battle.net launch",
+        DISCOVERY_TIMEOUT,
+        move || {
+            let bnet_exe = config.bnet_exe_path();
+            if !bnet_exe.exists() {
+                anyhow::bail!(
+                    "Battle.net not found at {}. Please install it first.",
+                    bnet_exe.display()
+                );
+            }
 
-    let prefix = config.prefix_path();
-    let runner = get_bnet_runner(&config.runner)?;
+            let prefix = config.prefix_path();
+            let runner = get_bnet_runner(&config.runner)?;
 
-    tracing::info!("Launching Battle.net...");
+            tracing::info!("Launching Battle.net...");
 
-    let mut cmd = build_wine_command(&runner, &prefix, &bnet_exe, config);
+            let mut cmd = build_wine_command(&runner, &prefix, &bnet_exe, &config);
 
-    // Add Battle.net specific args
-    for arg in &config.bnet_args {
-        cmd.arg(arg);
-    }
+            // Add Battle.net specific args
+            for arg in &config.bnet_args {
+                cmd.arg(arg);
+            }
 
-    // Add Battle.net specific env vars
-    for (key, value) in &config.bnet_env_vars {
-        cmd.env(key, value);
-    }
+            // Add Battle.net specific env vars
+            for (key, value) in &config.bnet_env_vars {
+                cmd.env(key, value);
+            }
+            Ok(cmd)
+        },
+    )
+    .await?;
 
     if let Some(sender) = log_sender {
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let child = cmd
-            .spawn()
-            .map_err(|e| anyhow::anyhow!("Failed to launch Battle.net: {e}"))?;
-        spawn_log_readers(child, sender);
+        let child = background::spawn_game(cmd).await?;
+        super::process::spawn_log_readers(child, sender, "BNet");
     } else {
-        let _child = cmd
-            .spawn()
-            .map_err(|e| anyhow::anyhow!("Failed to launch Battle.net: {e}"))?;
+        let mut child = background::spawn_game(cmd).await?;
+        tokio::spawn(async move {
+            let _ = child.wait().await;
+        });
     }
 
+    Ok(())
+}
+
+/// Wait until every process in the Battle.net prefix has exited.
+///
+/// # Errors
+/// Returns an error if the runner cannot be resolved or the prefix monitor fails.
+pub async fn wait_for_bnet_exit(config: &Config) -> anyhow::Result<()> {
     tracing::info!("Battle.net launched, waiting for all prefix processes to exit...");
 
     // The initial Battle.net process exits quickly after spawning the real client.
@@ -225,8 +270,14 @@ pub async fn launch_bnet(
     // `prefix` here is the outer compat-data dir; for Proton the actual Wine prefix
     // `wineserver` operates on lives at `<compat_data_path>/pfx`, so we must resolve the real
     // root or `wineserver --wait` will find nothing there and return immediately.
-    let runner = get_bnet_runner(&config.runner)?;
-    crate::launcher::wait_for_prefix_idle(&runner, &config.wine_prefix_root()).await
+    let config = config.clone();
+    let (runner, prefix) = background::blocking(
+        "Preparing Battle.net monitor",
+        DISCOVERY_TIMEOUT,
+        move || Ok((get_bnet_runner(&config.runner)?, config.wine_prefix_root())),
+    )
+    .await?;
+    crate::launcher::wait_for_prefix_idle(&runner, &prefix).await
 }
 
 /// Kill all Battle.net processes in the prefix.
@@ -234,8 +285,13 @@ pub async fn launch_bnet(
 /// # Errors
 /// Returns an error if the runner cannot be resolved.
 pub async fn kill_bnet(config: &Config) -> anyhow::Result<()> {
-    let runner = get_bnet_runner(&config.runner)?;
-    crate::launcher::kill_prefix(&runner, &config.wine_prefix_root()).await
+    let config = config.clone();
+    let (runner, prefix) =
+        background::blocking("Preparing Battle.net stop", IO_TIMEOUT, move || {
+            Ok((get_bnet_runner(&config.runner)?, config.wine_prefix_root()))
+        })
+        .await?;
+    crate::launcher::kill_prefix(&runner, &prefix).await
 }
 
 /// Build a Wine/Proton command with common env vars
@@ -275,78 +331,6 @@ fn build_wine_command(runner: &Runner, prefix: &Path, exe: &Path, config: &Confi
     }
 
     cmd
-}
-
-/// Create a new Wine prefix
-async fn create_prefix(runner: &Runner, prefix: &Path) -> anyhow::Result<()> {
-    std::fs::create_dir_all(prefix)?;
-
-    let wine_bin = crate::launcher::wine_bin_path(runner);
-
-    let status = Command::new(&wine_bin)
-        .arg("wineboot")
-        .arg("--init")
-        .env("WINEPREFIX", prefix)
-        .env("WINEARCH", "win64")
-        .status()
-        .await?;
-
-    if !status.success() {
-        anyhow::bail!("Failed to create Wine prefix");
-    }
-
-    Ok(())
-}
-
-/// Spawn a background task that reads stdout/stderr from a child process and sends log
-/// entries, stopping as soon as the direct child process exits.
-///
-/// We deliberately tie the readers' lifetime to the child's exit rather than to EOF on the
-/// pipes: Wine/Proton keep long-lived helper processes (e.g. `wineserver`) running in the
-/// background for the shared prefix, and those helpers inherit our piped stdout/stderr file
-/// descriptors. If we only stopped on EOF, the reader tasks — and the pipe file descriptors
-/// they hold open — would never be released for the lifetime of the app, leaking two file
-/// descriptors on every launch until the process runs out of them.
-fn spawn_log_readers(mut child: tokio::process::Child, sender: mpsc::UnboundedSender<LogEntry>) {
-    let mut stdout_lines = child.stdout.take().map(|s| BufReader::new(s).lines());
-    let mut stderr_lines = child.stderr.take().map(|s| BufReader::new(s).lines());
-
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                status = child.wait() => {
-                    if let Err(e) = status {
-                        tracing::warn!("Error waiting for BNet process: {e}");
-                    }
-                    break;
-                }
-                result = read_line(&mut stdout_lines) => {
-                    match result {
-                        Ok(Some(line)) => { let _ = sender.send(LogEntry::new("BNet", line)); }
-                        _ => stdout_lines = None,
-                    }
-                }
-                result = read_line(&mut stderr_lines) => {
-                    match result {
-                        Ok(Some(line)) => { let _ = sender.send(LogEntry::new("BNet", line)); }
-                        _ => stderr_lines = None,
-                    }
-                }
-            }
-        }
-    });
-}
-
-/// Read the next line from an optional line reader, resolving to a pending future forever if
-/// the reader has already been exhausted (so the corresponding `select!` arm is effectively
-/// disabled without needing separate `if` guards per branch).
-async fn read_line<R: tokio::io::AsyncBufRead + Unpin>(
-    lines: &mut Option<tokio::io::Lines<R>>,
-) -> std::io::Result<Option<String>> {
-    match lines {
-        Some(l) => l.next_line().await,
-        None => std::future::pending().await,
-    }
 }
 
 #[cfg(test)]

@@ -37,6 +37,16 @@ impl AppPaths {
         Self::data_dir().join("wow_prefix")
     }
 
+    /// Default Wine prefix location for a configured game client.
+    #[must_use]
+    pub fn default_game_prefix(client_id: &str) -> PathBuf {
+        if client_id == "retail" {
+            Self::default_wow_prefix()
+        } else {
+            Self::data_dir().join(format!("wow_prefix_{client_id}"))
+        }
+    }
+
     /// Log directory
     #[must_use]
     pub fn log_dir() -> PathBuf {
