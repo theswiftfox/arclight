@@ -167,6 +167,8 @@ fn with_gamescope_cmd(cmd: &Command, config: &Config) -> Command {
     for (key, val) in cmd.as_std().get_envs() {
         if let Some(v) = val {
             gamescope_cmd.env(key, v);
+        } else {
+            gamescope_cmd.env_remove(key);
         }
     }
 
@@ -193,6 +195,8 @@ fn with_gamemode_cmd(cmd: &Command) -> Command {
     for (key, val) in cmd.as_std().get_envs() {
         if let Some(v) = val {
             gamemode_cmd.env(key, v);
+        } else {
+            gamemode_cmd.env_remove(key);
         }
     }
 
