@@ -4,7 +4,7 @@ use std::{
 };
 
 use super::{Runner, steam};
-use crate::config::RunnerType;
+use crate::config::{AppPaths, RunnerType};
 
 /// A detected runner for use in UI (implements Display for `pick_list`)
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,6 +94,9 @@ pub fn detect_runners() -> Vec<DetectedRunner> {
         }
     }
 
+    // Runners downloaded by Arclight
+    collect_proton_runners(&mut runners, &AppPaths::runners_dir(), "");
+
     // Official Proton versions are installed into each Steam library's common directory.
     for library in steam::library_dirs() {
         collect_proton_runners(&mut runners, &library.join("steamapps/common"), "Steam ");
@@ -158,14 +161,25 @@ fn same_path(first: &Path, second: &Path) -> bool {
             .unwrap_or_else(|_| second.to_path_buf())
 }
 
-/// Find the best available runner (prefer Proton-GE, then system Wine).
+/// Pick the runner used automatically: the best Proton runner. Plain Wine
+/// runners are never chosen automatically, only when selected explicitly.
+#[must_use]
+pub fn automatic_runner(runners: &[DetectedRunner]) -> Option<&DetectedRunner> {
+    runners
+        .iter()
+        .find(|runner| runner.runner_type == RunnerType::Proton)
+}
+
+/// Find the best available runner (prefer Proton-GE, then other Proton).
 ///
 /// # Errors
-/// Returns an error if no Wine or Proton runner is found on the system.
+/// Returns an error if no Proton runner is found.
 pub fn find_best_runner() -> anyhow::Result<Runner> {
     let runners = detect_runners();
 
-    runners.first().map(Runner::from).ok_or_else(|| {
-        anyhow::anyhow!("No Wine or Proton runner found. Please install Wine or Proton-GE.")
+    automatic_runner(&runners).map(Runner::from).ok_or_else(|| {
+        anyhow::anyhow!(
+            "No Proton runner found. Download Proton-GE from Settings or select a runner manually."
+        )
     })
 }

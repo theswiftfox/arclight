@@ -25,6 +25,12 @@ impl AppPaths {
             .join("arclight")
     }
 
+    /// Runners downloaded by Arclight (e.g. Proton-GE)
+    #[must_use]
+    pub fn runners_dir() -> PathBuf {
+        Self::data_dir().join("runners")
+    }
+
     /// Default wine prefix location (used for Battle.net)
     #[must_use]
     pub fn default_prefix() -> PathBuf {

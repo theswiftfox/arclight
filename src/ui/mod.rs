@@ -133,6 +133,8 @@ pub enum Message {
     SettingsSaved(Result<(), String>),
     // Runner detection
     RunnersDetected(Result<RunnerDiscovery, String>),
+    DownloadProtonGe,
+    ProtonGeDownloaded(Result<std::path::PathBuf, String>),
     // Logs
     OpenLogs,
     LogsWindowOpened(window::Id),
@@ -184,6 +186,7 @@ pub struct App {
     killing_wow: bool,
     killing_bnet: bool,
     installing: bool,
+    downloading_runner: bool,
     auth_busy: bool,
     auth_generation: u64,
     automatic_runner: Option<DetectedRunner>,
@@ -248,6 +251,7 @@ impl App {
             killing_wow: false,
             killing_bnet: false,
             installing: false,
+            downloading_runner: false,
             auth_busy: false,
             auth_generation: 0,
             automatic_runner: None,
@@ -660,6 +664,44 @@ impl App {
                         Message::RunnersDetected,
                     ),
                 ])
+            }
+            Message::DownloadProtonGe if !self.downloading_runner => {
+                self.downloading_runner = true;
+                self.status = "Downloading Proton-GE (this can take a few minutes)...".into();
+                Task::perform(
+                    async {
+                        launcher::proton_ge::install_latest()
+                            .await
+                            .map_err(|error| format!("{error:#}"))
+                    },
+                    Message::ProtonGeDownloaded,
+                )
+            }
+            Message::ProtonGeDownloaded(result) => {
+                self.downloading_runner = false;
+                match result {
+                    Ok(path) => {
+                        tracing::info!("Installed Proton-GE at {}", path.display());
+                        self.status = "Proton-GE installed".into();
+                        let config = self.config.clone();
+                        Task::perform(
+                            async move {
+                                background::blocking(
+                                    "Runner discovery",
+                                    DISCOVERY_TIMEOUT,
+                                    move || Ok(discover_runners(&config)),
+                                )
+                                .await
+                                .map_err(|error| error.to_string())
+                            },
+                            Message::RunnersDetected,
+                        )
+                    }
+                    Err(error) => {
+                        self.status = format!("Proton-GE download failed: {error}");
+                        Task::none()
+                    }
+                }
             }
             Message::RunnersDetected(result) => {
                 self.loading = false;
@@ -1434,6 +1476,13 @@ impl App {
         } else {
             button("Using auto-detect").padding([6, 12])
         };
+        let download_ge = if self.downloading_runner {
+            button("Downloading Proton-GE...").padding([6, 12])
+        } else {
+            button("Download Proton-GE")
+                .padding([6, 12])
+                .on_press(Message::DownloadProtonGe)
+        };
 
         // On launch behavior
         let on_launch_label = text("On game launch:").size(14);
@@ -1666,7 +1715,7 @@ impl App {
             game_path_field,
             space().height(8),
             runner_label,
-            row![runner_picker, runner_reset].spacing(8),
+            row![runner_picker, runner_reset, download_ge].spacing(8),
             space().height(8),
             on_launch_label,
             on_launch_picker,
@@ -1888,7 +1937,7 @@ fn effective_runner_label(
     } else if let Some(runner) = automatic {
         format!("Runner: {} (auto)", runner.name)
     } else {
-        "No runner detected".into()
+        "No Proton runner — download Proton-GE in Settings".into()
     }
 }
 
@@ -1941,7 +1990,7 @@ fn validate_game_clients(clients: &[GameClient]) -> Result<(), String> {
 
 fn discover_runners(config: &Config) -> RunnerDiscovery {
     let mut runners = launcher::detect::detect_runners();
-    let automatic = runners.first().cloned();
+    let automatic = launcher::detect::automatic_runner(&runners).cloned();
     let selected = config
         .runner
         .binary

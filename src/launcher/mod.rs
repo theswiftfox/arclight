@@ -1,6 +1,7 @@
 pub mod bnet;
 pub mod detect;
 pub mod process;
+pub mod proton_ge;
 pub mod steam;
 
 use std::{
@@ -215,14 +216,37 @@ pub async fn create_prefix(
     name: &'static str,
 ) -> anyhow::Result<()> {
     let prefix = prefix.to_path_buf();
+    let runner_path = runner.path.clone();
     let runner = runner.clone();
     let command = background::mutation(name, move || {
         std::fs::create_dir_all(&prefix)?;
         prefix_init_command(&runner, &prefix)
     })
     .await?;
-    if let Some(command) = command {
-        background::command_status(command, name, SETUP_TIMEOUT).await?;
+    if let Some(mut command) = command {
+        let output = background::deadline(name, SETUP_TIMEOUT, async {
+            Ok(command.kill_on_drop(true).output().await?)
+        })
+        .await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let tail = stderr
+                .lines()
+                .filter(|line| !line.contains(":fixme:"))
+                .rev()
+                .take(15)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n");
+            tracing::error!("{name} failed ({}):\n{tail}", output.status);
+            anyhow::bail!(
+                "{name} exited with {}\nRunner: {}\n{tail}",
+                output.status,
+                runner_path.display()
+            );
+        }
     }
     Ok(())
 }
