@@ -39,3 +39,6 @@ arboard = "3"
 
 # Time
 chrono = "0.4"
+
+# Native file dialogs
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }

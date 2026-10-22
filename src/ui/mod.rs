@@ -26,6 +26,14 @@ pub mod theme;
 
 pub use theme::wow_theme;
 
+#[derive(Debug, Clone, Copy)]
+pub enum PathTarget {
+    GamePath,
+    ClientExecutable(usize),
+    ClientPrefix(usize),
+    DriveMapping(usize),
+}
+
 #[must_use]
 pub fn theme(_app: &App, _window: window::Id) -> iced::Theme {
     wow_theme()
@@ -89,6 +97,8 @@ pub enum Message {
     AuthStatusChecked(u64, Result<AuthStatus, String>),
     // Settings
     GamePathChanged(String),
+    BrowsePath(PathTarget),
+    PathPicked(PathTarget, Option<std::path::PathBuf>),
     RunnerSelected(DetectedRunner),
     RunnerReset,
     GameClientNameChanged(usize, String),
@@ -933,6 +943,96 @@ impl App {
         )
     }
 
+    fn browse_path(&self, target: PathTarget) -> Task<Message> {
+        let game_root = std::path::PathBuf::from(self.game_path_input.trim());
+        let (title, pick_files, current) = match target {
+            PathTarget::GamePath => (
+                "Select WoW install folder",
+                false,
+                self.game_path_input.clone(),
+            ),
+            PathTarget::ClientExecutable(idx) => (
+                "Select game executable",
+                true,
+                self.config
+                    .game_clients
+                    .get(idx)
+                    .map_or_else(String::new, |c| {
+                        game_root.join(&c.executable).to_string_lossy().into_owned()
+                    }),
+            ),
+            PathTarget::ClientPrefix(idx) => (
+                "Select Wine prefix folder",
+                false,
+                self.config
+                    .game_clients
+                    .get(idx)
+                    .map_or_else(String::new, |c| {
+                        c.prefix_path().to_string_lossy().into_owned()
+                    }),
+            ),
+            PathTarget::DriveMapping(idx) => (
+                "Select drive folder",
+                false,
+                self.drive_mappings
+                    .get(idx)
+                    .map_or_else(String::new, |(_, p)| p.clone()),
+            ),
+        };
+        let mut start = std::path::PathBuf::from(current.trim());
+        while !start.as_os_str().is_empty() && !start.is_dir() {
+            start.pop();
+        }
+        if start.as_os_str().is_empty() && matches!(target, PathTarget::ClientExecutable(_)) {
+            start = game_root;
+        }
+        Task::perform(
+            async move {
+                let mut dialog = rfd::AsyncFileDialog::new().set_title(title);
+                if start.is_dir() {
+                    dialog = dialog.set_directory(start);
+                }
+                let handle = if pick_files {
+                    dialog.pick_file().await
+                } else {
+                    dialog.pick_folder().await
+                };
+                handle.map(|h| h.path().to_path_buf())
+            },
+            move |path| Message::PathPicked(target, path),
+        )
+    }
+
+    fn apply_picked_path(&mut self, target: PathTarget, path: &std::path::Path) {
+        match target {
+            PathTarget::GamePath => self.game_path_input = path.to_string_lossy().into_owned(),
+            PathTarget::ClientExecutable(idx) => {
+                let root = std::path::PathBuf::from(self.game_path_input.trim());
+                match path.strip_prefix(&root) {
+                    Ok(relative) if !relative.as_os_str().is_empty() => {
+                        if let Some(client) = self.config.game_clients.get_mut(idx) {
+                            client.executable = relative.to_path_buf();
+                        }
+                    }
+                    _ => {
+                        self.status =
+                            "Executable must be inside the WoW install folder".to_string();
+                    }
+                }
+            }
+            PathTarget::ClientPrefix(idx) => {
+                if let Some(client) = self.config.game_clients.get_mut(idx) {
+                    client.prefix = Some(path.to_path_buf());
+                }
+            }
+            PathTarget::DriveMapping(idx) => {
+                if let Some(entry) = self.drive_mappings.get_mut(idx) {
+                    entry.1 = path.to_string_lossy().into_owned();
+                }
+            }
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn handle_settings_input(&mut self, message: Message) -> Task<Message> {
         if !self.loaded || self.saving {
@@ -940,6 +1040,9 @@ impl App {
         }
         match message {
             Message::GamePathChanged(path) => self.game_path_input = path,
+            Message::BrowsePath(target) => return self.browse_path(target),
+            Message::PathPicked(target, Some(path)) => self.apply_picked_path(target, &path),
+            Message::PathPicked(_, None) => {}
             Message::RunnerSelected(runner) => {
                 self.config.runner.binary = Some(runner.path.clone());
                 self.config.runner.runner_type = runner.runner_type;
@@ -1483,7 +1586,11 @@ impl App {
         let game_path_label = text("WoW Install Path:").size(14);
         let game_path_field = text_input("/path/to/World of Warcraft", &self.game_path_input)
             .on_input(Message::GamePathChanged)
-            .padding(8);
+            .padding(8)
+            .width(Length::Fill);
+        let game_path_field = row![game_path_field, browse_button(PathTarget::GamePath)]
+            .spacing(4)
+            .align_y(iced::Alignment::Center);
 
         // Runner selection
         let runner_label = text("Runner:").size(14);
@@ -1550,7 +1657,11 @@ impl App {
             let executable = client.executable.to_string_lossy();
             let executable = text_input("_retail_/Wow.exe", &executable)
                 .on_input(move |value| Message::GameClientExecutableChanged(idx, value))
-                .padding(8);
+                .padding(8)
+                .width(Length::Fill);
+            let executable = row![executable, browse_button(PathTarget::ClientExecutable(idx))]
+                .spacing(4)
+                .align_y(iced::Alignment::Center);
             let prefix = client
                 .prefix
                 .as_ref()
@@ -1560,7 +1671,11 @@ impl App {
                 &prefix,
             )
             .on_input(move |value| Message::GameClientPrefixChanged(idx, value))
-            .padding(8);
+            .padding(8)
+            .width(Length::Fill);
+            let prefix = row![prefix, browse_button(PathTarget::ClientPrefix(idx))]
+                .spacing(4)
+                .align_y(iced::Alignment::Center);
             let selected_override = client.runner.as_ref().and_then(|configured| {
                 self.detected_runners.iter().find(|runner| {
                     same_path(&runner.path, &configured.binary)
@@ -1641,9 +1756,15 @@ impl App {
                 .padding([4, 8])
                 .on_press(Message::RemoveDriveMapping(idx));
             drive_col = drive_col.push(
-                row![letter_input, colon, path_input, remove_btn]
-                    .spacing(4)
-                    .align_y(iced::Alignment::Center),
+                row![
+                    letter_input,
+                    colon,
+                    path_input,
+                    browse_button(PathTarget::DriveMapping(idx)),
+                    remove_btn
+                ]
+                .spacing(4)
+                .align_y(iced::Alignment::Center),
             );
         }
         let add_drive_btn = button("+ Add Drive")
@@ -1944,6 +2065,13 @@ fn configured_runner(
     };
     runners.push(runner.clone());
     runner
+}
+
+fn browse_button<'a>(target: PathTarget) -> Element<'a, Message> {
+    button("...")
+        .padding([6, 12])
+        .on_press(Message::BrowsePath(target))
+        .into()
 }
 
 fn same_path(first: &std::path::Path, second: &std::path::Path) -> bool {
