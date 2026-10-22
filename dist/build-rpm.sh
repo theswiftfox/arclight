@@ -2,8 +2,9 @@
 set -euo pipefail
 
 NAME="arclight"
-VERSION="0.2.2"
-RELEASE="1"
+VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+RELEASE="${RELEASE:-1}"
+CHANGELOG_MSG="${1:-$(git log -1 --format=%s)}"
 TOPDIR="$(pwd)/rpmbuild"
 
 echo "> Cleaning previous build..."
@@ -19,8 +20,8 @@ tar czf "$TOPDIR/SOURCES/${NAME}-${VERSION}.tar.gz" \
 echo "> Writing spec file..."
 cat > "$TOPDIR/SPECS/${NAME}.spec" << 'SPEC'
 Name:           arclight
-Version:        0.2.2
-Release:        1%{?dist}
+Version:        @VERSION@
+Release:        @RELEASE@%{?dist}
 Summary:        Native Linux launcher for World of Warcraft
 License:        MIT
 URL:            https://github.com/theswiftfox/arclight
@@ -65,10 +66,12 @@ make install DESTDIR=%{buildroot} PREFIX=%{_prefix}
 %changelog
 SPEC
 
+sed -i "s/@VERSION@/${VERSION}/; s/@RELEASE@/${RELEASE}/" "$TOPDIR/SPECS/${NAME}.spec"
+
 # Append changelog with dynamic date/name (outside heredoc to allow expansion)
 cat >> "$TOPDIR/SPECS/${NAME}.spec" << EOF
 * $(date '+%a %b %d %Y') $(git config user.name) <$(git config user.email)> - ${VERSION}-${RELEASE}
-- Add file pickers for path settings, Battle.net scaling, Proton-GE download, and settings UI improvements
+- ${CHANGELOG_MSG}
 EOF
 
 echo "> Building RPM..."
