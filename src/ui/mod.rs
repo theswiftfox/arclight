@@ -172,6 +172,8 @@ pub enum Message {
     BnetRunnerReset,
     OnLaunchChanged(OnLaunchBehavior),
     BnetScaleChanged(u32),
+    FocusNext,
+    FocusPrevious,
     JumpToSection(SettingsSection),
     SectionScrollTarget(Option<f32>),
     // WoW settings
@@ -384,7 +386,21 @@ impl App {
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
-        iced::window::close_requests().map(Message::WindowCloseRequested)
+        Subscription::batch([
+            iced::window::close_requests().map(Message::WindowCloseRequested),
+            iced::event::listen_with(|event, _status, _window| match event {
+                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Tab),
+                    modifiers,
+                    ..
+                }) if !modifiers.control() && !modifiers.alt() => Some(if modifiers.shift() {
+                    Message::FocusPrevious
+                } else {
+                    Message::FocusNext
+                }),
+                _ => None,
+            }),
+        ])
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1251,6 +1267,13 @@ impl App {
                 self.selected_bnet_runner = None;
             }
             Message::OnLaunchChanged(behavior) => self.config.on_launch = behavior,
+            Message::FocusNext if matches!(self.screen, Screen::Settings) => {
+                return iced::widget::operation::focus_next().chain(reveal_focused());
+            }
+            Message::FocusPrevious if matches!(self.screen, Screen::Settings) => {
+                return iced::widget::operation::focus_previous().chain(reveal_focused());
+            }
+            Message::FocusNext | Message::FocusPrevious => {}
             Message::JumpToSection(section) => {
                 use iced::widget::selector;
                 return selector::find(selector::id(section.id()))
@@ -2198,6 +2221,44 @@ fn configured_runner(
     };
     runners.push(runner.clone());
     runner
+}
+
+/// Scrolls the settings just enough to bring the focused widget into view.
+fn reveal_focused() -> Task<Message> {
+    use iced::widget::selector::{self, Target};
+    const MARGIN: f32 = 16.0;
+
+    selector::find(selector::is_focused())
+        .then(|focused| {
+            let Some(focused) = focused else {
+                return Task::done(None);
+            };
+            selector::find(selector::id(SETTINGS_CONTENT_ID)).then(move |top| {
+                let (focused, Some(top)) = (focused.clone(), top) else {
+                    return Task::done(None);
+                };
+                selector::find(selector::id(SETTINGS_SCROLL_ID)).map(move |scroll| {
+                    let Some(Target::Scrollable {
+                        bounds,
+                        translation,
+                        ..
+                    }) = scroll
+                    else {
+                        return None;
+                    };
+                    let top_y = focused.bounds().y - top.bounds().y;
+                    let bottom_y = top_y + focused.bounds().height;
+                    if top_y < translation.y + MARGIN {
+                        Some(top_y - MARGIN)
+                    } else if bottom_y > translation.y + bounds.height - MARGIN {
+                        Some(bottom_y - bounds.height + MARGIN)
+                    } else {
+                        None
+                    }
+                })
+            })
+        })
+        .map(Message::SectionScrollTarget)
 }
 
 fn section_header<'a>(section: SettingsSection) -> Element<'a, Message> {
