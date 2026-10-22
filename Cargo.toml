@@ -6,7 +6,7 @@ description = "A native Linux launcher for World of Warcraft"
 
 [dependencies]
 # GUI
-iced = { version = "0.14", features = ["tokio"] }
+iced = { version = "0.14", features = ["tokio", "selector"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

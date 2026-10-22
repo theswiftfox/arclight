@@ -26,6 +26,61 @@ pub mod theme;
 
 pub use theme::wow_theme;
 
+const SETTINGS_SCROLL_ID: &str = "settings-scroll";
+const SETTINGS_CONTENT_ID: &str = "settings-content";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsSection {
+    General,
+    Clients,
+    Drives,
+    Performance,
+    Battlenet,
+}
+
+impl SettingsSection {
+    const ALL: [Self; 5] = [
+        Self::General,
+        Self::Clients,
+        Self::Drives,
+        Self::Performance,
+        Self::Battlenet,
+    ];
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::General => "General",
+            Self::Clients => "Game Clients",
+            Self::Drives => "Drive Mappings",
+            Self::Performance => "Performance",
+            Self::Battlenet => "Battle.net",
+        }
+    }
+
+    fn id(self) -> &'static str {
+        match self {
+            Self::General => "settings-section-general",
+            Self::Clients => "settings-section-clients",
+            Self::Drives => "settings-section-drives",
+            Self::Performance => "settings-section-performance",
+            Self::Battlenet => "settings-section-battlenet",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SettingsSnapshot {
+    config: Config,
+    game_path_input: String,
+    wow_args_input: String,
+    wow_env_vars: Vec<(String, String)>,
+    bnet_args_input: String,
+    bnet_env_vars: Vec<(String, String)>,
+    drive_mappings: Vec<(String, String)>,
+    selected_runner: Option<DetectedRunner>,
+    selected_bnet_runner: Option<DetectedRunner>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum PathTarget {
     GamePath,
@@ -117,8 +172,8 @@ pub enum Message {
     BnetRunnerReset,
     OnLaunchChanged(OnLaunchBehavior),
     BnetScaleChanged(u32),
-    ApplyBnetScale,
-    BnetScaleApplied(Result<(), String>),
+    JumpToSection(SettingsSection),
+    SectionScrollTarget(Option<f32>),
     // WoW settings
     WowArgsChanged(String),
     WowSkipDefaultArgsToggled(bool),
@@ -186,6 +241,7 @@ pub struct App {
     bnet_args_input: String,
     bnet_env_vars: Vec<(String, String)>,
     drive_mappings: Vec<(String, String)>,
+    settings_snapshot: Option<SettingsSnapshot>,
     // Logs
     log_buffer: logs::LogBuffer,
     log_sender: logs::LogSender,
@@ -254,6 +310,7 @@ impl App {
             bnet_args_input,
             bnet_env_vars,
             drive_mappings,
+            settings_snapshot: None,
             log_buffer: logs::LogBuffer::default(),
             log_sender,
             logs_window_id: None,
@@ -404,10 +461,16 @@ impl App {
                 }
             }
             Message::GoToSettings if self.loaded => {
+                self.settings_snapshot = Some(self.snapshot_settings());
                 self.screen = Screen::Settings;
                 Task::none()
             }
             Message::GoToMain => {
+                if !self.saving
+                    && let Some(snapshot) = self.settings_snapshot.take()
+                {
+                    self.restore_settings(snapshot);
+                }
                 self.screen = Screen::Main;
                 Task::none()
             }
@@ -660,6 +723,7 @@ impl App {
                         return Task::none();
                     }
                 }
+                self.settings_snapshot = None;
                 self.screen = Screen::Main;
                 // Supersede any auth read for the previous settings.
                 self.auth_busy = false;
@@ -878,8 +942,34 @@ impl App {
         )
     }
 
+    fn snapshot_settings(&self) -> SettingsSnapshot {
+        SettingsSnapshot {
+            config: self.config.clone(),
+            game_path_input: self.game_path_input.clone(),
+            wow_args_input: self.wow_args_input.clone(),
+            wow_env_vars: self.wow_env_vars.clone(),
+            bnet_args_input: self.bnet_args_input.clone(),
+            bnet_env_vars: self.bnet_env_vars.clone(),
+            drive_mappings: self.drive_mappings.clone(),
+            selected_runner: self.selected_runner.clone(),
+            selected_bnet_runner: self.selected_bnet_runner.clone(),
+        }
+    }
+
+    fn restore_settings(&mut self, snapshot: SettingsSnapshot) {
+        self.config = snapshot.config;
+        self.game_path_input = snapshot.game_path_input;
+        self.wow_args_input = snapshot.wow_args_input;
+        self.wow_env_vars = snapshot.wow_env_vars;
+        self.bnet_args_input = snapshot.bnet_args_input;
+        self.bnet_env_vars = snapshot.bnet_env_vars;
+        self.drive_mappings = snapshot.drive_mappings;
+        self.selected_runner = snapshot.selected_runner;
+        self.selected_bnet_runner = snapshot.selected_bnet_runner;
+    }
+
     fn handle_save_settings(&mut self) -> Task<Message> {
-        if !self.loaded || self.saving || self.launching || self.bnet_busy {
+        if !self.loaded || self.saving {
             return Task::none();
         }
         self.saving = true;
@@ -929,15 +1019,29 @@ impl App {
         self.config.ensure_selected_client();
 
         let config = self.config.clone();
+        let apply_scale = config.bnet_installed()
+            && self
+                .settings_snapshot
+                .as_ref()
+                .is_some_and(|s| s.config.bnet_scale_percent != config.bnet_scale_percent);
         Task::perform(
             async move {
+                let scale_config = config.clone();
                 background::mutation("Saving settings", move || {
                     let _setup = background::prefix_setup()?;
                     config.apply_drive_mappings()?;
                     config.save()
                 })
                 .await
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string())?;
+                if apply_scale {
+                    crate::launcher::bnet::apply_bnet_scaling(&scale_config)
+                        .await
+                        .map_err(|e| {
+                            format!("settings were saved, but applying scaling failed: {e}")
+                        })?;
+                }
+                Ok(())
             },
             Message::SettingsSaved,
         )
@@ -1147,26 +1251,26 @@ impl App {
                 self.selected_bnet_runner = None;
             }
             Message::OnLaunchChanged(behavior) => self.config.on_launch = behavior,
-            Message::ApplyBnetScale if !self.bnet_busy && self.config.bnet_installed() => {
-                self.bnet_busy = true;
-                self.status = "Applying Battle.net scaling...".into();
-                let config = self.config.clone();
-                return Task::perform(
-                    async move {
-                        crate::launcher::bnet::apply_bnet_scaling(&config)
-                            .await
-                            .map_err(|error| error.to_string())
+            Message::JumpToSection(section) => {
+                use iced::widget::selector;
+                return selector::find(selector::id(section.id()))
+                    .then(|target| match target {
+                        Some(section) => selector::find(selector::id(SETTINGS_CONTENT_ID))
+                            .map(move |top| top.map(|top| section.bounds().y - top.bounds().y)),
+                        None => Task::done(None),
+                    })
+                    .map(Message::SectionScrollTarget);
+            }
+            Message::SectionScrollTarget(Some(y)) => {
+                return iced::widget::operation::scroll_to(
+                    SETTINGS_SCROLL_ID,
+                    iced::widget::scrollable::AbsoluteOffset {
+                        x: None,
+                        y: Some(y.max(0.0)),
                     },
-                    Message::BnetScaleApplied,
                 );
             }
-            Message::BnetScaleApplied(result) => {
-                self.bnet_busy = false;
-                self.status = match result {
-                    Ok(()) => "Battle.net scaling applied".into(),
-                    Err(e) => format!("Failed to apply scaling: {e}"),
-                };
-            }
+            Message::SectionScrollTarget(None) => {}
             Message::BnetScaleChanged(percent) => self.config.bnet_scale_percent = percent,
             Message::WowArgsChanged(args) => self.wow_args_input = args,
             Message::WowSkipDefaultArgsToggled(val) => self.config.wow_skip_default_args = val,
@@ -1572,9 +1676,9 @@ impl App {
     fn view_settings(&self) -> Element<'_, Message> {
         // Top bar
         let title = text("Settings").size(28);
-        let save_btn = button("Save").padding([8, 20]).on_press_maybe(
-            (!self.saving && !self.launching && !self.bnet_busy).then_some(Message::SaveSettings),
-        );
+        let save_btn = button("Save")
+            .padding([8, 20])
+            .on_press_maybe((!self.saving).then_some(Message::SaveSettings));
         let back_btn = button("Cancel")
             .padding([8, 20])
             .on_press(Message::GoToMain);
@@ -1617,11 +1721,7 @@ impl App {
                 .on_press(Message::DownloadProtonGe)
         };
 
-        let bnet_scale_label = text("Battle.net scaling (%):").size(14);
-        let apply_scale = button("Apply").padding([8, 16]).on_press_maybe(
-            (!self.bnet_busy && !self.launching && self.config.bnet_installed())
-                .then_some(Message::ApplyBnetScale),
-        );
+        let bnet_scale_label = text("Battle.net scaling (%, applied on save):").size(14);
         let bnet_scale_picker = pick_list(
             BNET_SCALE_OPTIONS.to_vec(),
             Some(self.config.bnet_scale_percent),
@@ -1644,8 +1744,8 @@ impl App {
         .padding(8)
         .width(Length::Fill);
 
-        let clients_header = text("Game Clients").size(18);
-        let mut clients_column = column![].spacing(16);
+        let clients_header = section_header(SettingsSection::Clients);
+        let mut clients_column = column![].spacing(12);
         for (idx, client) in self.config.game_clients.iter().enumerate() {
             let name = text_input("Client name", &client.name)
                 .on_input(move |value| Message::GameClientNameChanged(idx, value))
@@ -1721,18 +1821,23 @@ impl App {
                     .on_press(Message::AddGameClientEnvVar(idx)),
             );
             clients_column = clients_column.push(
-                column![
-                    row![name, remove].spacing(8),
-                    text("Relative executable:").size(14),
-                    executable,
-                    text("Prefix (blank uses the client default):").size(14),
-                    prefix,
-                    text("Runner override:").size(14),
-                    row![runner_picker, runner_reset].spacing(8),
-                    args,
-                    env_column,
-                ]
-                .spacing(6),
+                container(
+                    column![
+                        row![name, remove].spacing(8),
+                        text("Relative executable:").size(14),
+                        executable,
+                        text("Prefix (blank uses the client default):").size(14),
+                        prefix,
+                        text("Runner override:").size(14),
+                        row![runner_picker, runner_reset].spacing(8),
+                        args,
+                        env_column,
+                    ]
+                    .spacing(6),
+                )
+                .padding(12)
+                .width(Length::Fill)
+                .style(container::bordered_box),
             );
         }
         let add_client = button("+ Add Client")
@@ -1740,7 +1845,7 @@ impl App {
             .on_press(Message::AddGameClient);
 
         // Drive Mappings Section
-        let drive_header = text("Drive Mappings").size(18);
+        let drive_header = section_header(SettingsSection::Drives);
         let mut drive_col = column![].spacing(4);
         for (idx, (letter, path)) in self.drive_mappings.iter().enumerate() {
             let letter_input = text_input("d", letter)
@@ -1772,7 +1877,7 @@ impl App {
             .on_press(Message::AddDriveMapping);
 
         // Performance Section
-        let perf_header = text("Performance").size(18);
+        let perf_header = section_header(SettingsSection::Performance);
 
         let mangohud_checkbox = checkbox(self.config.mangohud_enabled)
             .label("Enable MangoHud")
@@ -1805,7 +1910,7 @@ impl App {
         };
 
         // Battle.net Section
-        let bnet_header = text("Battle.net Settings").size(18);
+        let bnet_header = section_header(SettingsSection::Battlenet);
 
         let bnet_status = if self.auth_status == AuthStatus::NotInstalled {
             text("Status: Not installed").size(12)
@@ -1867,10 +1972,23 @@ impl App {
                 .on_press(Message::InstallBnet)
         };
 
+        let nav = SettingsSection::ALL.iter().fold(
+            row![].spacing(6).align_y(iced::Alignment::Center),
+            |nav, &section| {
+                nav.push(
+                    button(text(section.title()).size(13))
+                        .padding([4, 12])
+                        .style(button::secondary)
+                        .on_press(Message::JumpToSection(section)),
+                )
+            },
+        );
+        let header = container(column![top_bar, text(&self.status).size(12), nav].spacing(8))
+            .padding([20, 40])
+            .width(Length::Fill);
+
         let mut content = column![
-            top_bar,
-            text(&self.status).size(12),
-            space().height(12),
+            section_header(SettingsSection::General),
             game_path_label,
             game_path_field,
             space().height(8),
@@ -1882,6 +2000,7 @@ impl App {
             space().height(16),
             clients_header,
             clients_column,
+            space().height(4),
             add_client,
             space().height(16),
             // Drive mappings section
@@ -1898,7 +2017,7 @@ impl App {
             gamemode_checkbox,
         ]
         .spacing(6)
-        .padding(40)
+        .padding([0, 40])
         .width(Length::Fill);
 
         if let Some(warning) = gamemode_warning {
@@ -1914,7 +2033,7 @@ impl App {
             .push(bnet_runner_picker)
             .push(bnet_runner_reset)
             .push(bnet_scale_label)
-            .push(row![bnet_scale_picker, apply_scale].spacing(8))
+            .push(bnet_scale_picker)
             .push(bnet_args_label)
             .push(bnet_args_field)
             .push(bnet_env_label)
@@ -1923,12 +2042,26 @@ impl App {
             .push(space().height(8))
             .push(install_bnet_btn);
 
-        iced::widget::scrollable(
-            container(content)
-                .width(Length::Fill)
-                .height(Length::Shrink),
-        )
-        .height(Length::Fill)
+        content = content.push(space().height(40));
+
+        column![
+            header,
+            container(
+                iced::widget::scrollable(
+                    container(content)
+                        .id(SETTINGS_CONTENT_ID)
+                        .width(Length::Fill)
+                        .height(Length::Shrink),
+                )
+                .id(SETTINGS_SCROLL_ID)
+                .height(Length::Fill),
+            )
+            .padding(iced::Padding {
+                bottom: 10.0,
+                ..iced::Padding::ZERO
+            })
+            .height(Length::Fill),
+        ]
         .into()
     }
 }
@@ -2065,6 +2198,24 @@ fn configured_runner(
     };
     runners.push(runner.clone());
     runner
+}
+
+fn section_header<'a>(section: SettingsSection) -> Element<'a, Message> {
+    let bold = Font {
+        weight: iced::font::Weight::Bold,
+        ..Font::DEFAULT
+    };
+    container(
+        column![
+            space().height(12),
+            text(section.title()).size(24).font(bold),
+            iced::widget::rule::horizontal(2),
+        ]
+        .spacing(6),
+    )
+    .id(section.id())
+    .width(Length::Fill)
+    .into()
 }
 
 fn browse_button<'a>(target: PathTarget) -> Element<'a, Message> {
