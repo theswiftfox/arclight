@@ -2,7 +2,7 @@
 set -euo pipefail
 
 NAME="arclight"
-VERSION="0.2.1"
+VERSION="0.2.2"
 RELEASE="1"
 TOPDIR="$(pwd)/rpmbuild"
 
@@ -19,7 +19,7 @@ tar czf "$TOPDIR/SOURCES/${NAME}-${VERSION}.tar.gz" \
 echo "> Writing spec file..."
 cat > "$TOPDIR/SPECS/${NAME}.spec" << 'SPEC'
 Name:           arclight
-Version:        0.2.1
+Version:        0.2.2
 Release:        1%{?dist}
 Summary:        Native Linux launcher for World of Warcraft
 License:        MIT
@@ -68,7 +68,7 @@ SPEC
 # Append changelog with dynamic date/name (outside heredoc to allow expansion)
 cat >> "$TOPDIR/SPECS/${NAME}.spec" << EOF
 * $(date '+%a %b %d %Y') $(git config user.name) <$(git config user.email)> - ${VERSION}-${RELEASE}
-- Work around frozen UI redraws on Wayland by disabling vsync (iced#3496)
+- Add file pickers for path settings, Battle.net scaling, Proton-GE download, and settings UI improvements
 EOF
 
 echo "> Building RPM..."
