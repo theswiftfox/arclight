@@ -11,7 +11,9 @@ use iced::{
 
 use crate::{
     background::{self, DISCOVERY_TIMEOUT, IO_TIMEOUT},
-    config::{Config, GameClient, OnLaunchBehavior, RunnerOverride, RunnerType},
+    config::{
+        BNET_SCALE_OPTIONS, Config, GameClient, OnLaunchBehavior, RunnerOverride, RunnerType,
+    },
     launcher,
     launcher::{
         bnet::{self, AuthStatus},
@@ -104,6 +106,9 @@ pub enum Message {
     BnetRunnerSelected(DetectedRunner),
     BnetRunnerReset,
     OnLaunchChanged(OnLaunchBehavior),
+    BnetScaleChanged(u32),
+    ApplyBnetScale,
+    BnetScaleApplied(Result<(), String>),
     // WoW settings
     WowArgsChanged(String),
     WowSkipDefaultArgsToggled(bool),
@@ -1039,6 +1044,27 @@ impl App {
                 self.selected_bnet_runner = None;
             }
             Message::OnLaunchChanged(behavior) => self.config.on_launch = behavior,
+            Message::ApplyBnetScale if !self.bnet_busy && self.config.bnet_installed() => {
+                self.bnet_busy = true;
+                self.status = "Applying Battle.net scaling...".into();
+                let config = self.config.clone();
+                return Task::perform(
+                    async move {
+                        crate::launcher::bnet::apply_bnet_scaling(&config)
+                            .await
+                            .map_err(|error| error.to_string())
+                    },
+                    Message::BnetScaleApplied,
+                );
+            }
+            Message::BnetScaleApplied(result) => {
+                self.bnet_busy = false;
+                self.status = match result {
+                    Ok(()) => "Battle.net scaling applied".into(),
+                    Err(e) => format!("Failed to apply scaling: {e}"),
+                };
+            }
+            Message::BnetScaleChanged(percent) => self.config.bnet_scale_percent = percent,
             Message::WowArgsChanged(args) => self.wow_args_input = args,
             Message::WowSkipDefaultArgsToggled(val) => self.config.wow_skip_default_args = val,
             Message::WowEnvKeyChanged(idx, key) => {
@@ -1484,6 +1510,19 @@ impl App {
                 .on_press(Message::DownloadProtonGe)
         };
 
+        let bnet_scale_label = text("Battle.net scaling (%):").size(14);
+        let apply_scale = button("Apply").padding([8, 16]).on_press_maybe(
+            (!self.bnet_busy && !self.launching && self.config.bnet_installed())
+                .then_some(Message::ApplyBnetScale),
+        );
+        let bnet_scale_picker = pick_list(
+            BNET_SCALE_OPTIONS.to_vec(),
+            Some(self.config.bnet_scale_percent),
+            Message::BnetScaleChanged,
+        )
+        .padding(8)
+        .width(Length::Fill);
+
         // On launch behavior
         let on_launch_label = text("On game launch:").size(14);
         let on_launch_picker = pick_list(
@@ -1753,6 +1792,8 @@ impl App {
             .push(bnet_runner_label)
             .push(bnet_runner_picker)
             .push(bnet_runner_reset)
+            .push(bnet_scale_label)
+            .push(row![bnet_scale_picker, apply_scale].spacing(8))
             .push(bnet_args_label)
             .push(bnet_args_field)
             .push(bnet_env_label)

@@ -185,9 +185,14 @@ pub async fn install_bnet(config: &Config, installer_path: Option<&Path>) -> any
 
     tracing::info!("Running Battle.net installer...");
 
-    let config = config.clone();
+    let command_config = config.clone();
     let cmd = background::blocking("Building installer command", IO_TIMEOUT, move || {
-        Ok(build_wine_command(&runner, &prefix, &installer, &config))
+        Ok(build_wine_command(
+            &runner,
+            &prefix,
+            &installer,
+            &command_config,
+        ))
     })
     .await?;
     let mut child = background::spawn(cmd).await?;
@@ -198,7 +203,58 @@ pub async fn install_bnet(config: &Config, installer_path: Option<&Path>) -> any
         anyhow::bail!("Battle.net installer exited with status: {status}");
     }
 
+    if config.bnet_scale_percent != 100
+        && let Err(error) = apply_bnet_scaling(config).await
+    {
+        tracing::warn!("Could not apply Battle.net scaling: {error}");
+    }
+
     tracing::info!("Battle.net installation complete");
+    Ok(())
+}
+
+/// Set the Wine DPI of the Battle.net prefix to match the configured scale.
+///
+/// # Errors
+/// Returns an error if Wine cannot be resolved or `reg add` fails.
+pub async fn apply_bnet_scaling(config: &Config) -> anyhow::Result<()> {
+    let config = config.clone();
+    let (wine, prefix, dpi) = background::blocking(
+        "Preparing Battle.net scaling",
+        DISCOVERY_TIMEOUT,
+        move || {
+            let runner = get_bnet_runner(&config.runner)?;
+            Ok((
+                crate::launcher::wine_bin_path(&runner)?,
+                config.wine_prefix_root(),
+                config.bnet_dpi(),
+            ))
+        },
+    )
+    .await?;
+    let output = background::deadline("Setting Battle.net scaling", IO_TIMEOUT, async {
+        Ok(Command::new(wine)
+            .args([
+                "reg",
+                "add",
+                "HKEY_CURRENT_USER\\Control Panel\\Desktop",
+                "/v",
+                "LogPixels",
+                "/t",
+                "REG_DWORD",
+                "/d",
+            ])
+            .arg(dpi.to_string())
+            .arg("/f")
+            .env("WINEPREFIX", prefix)
+            .kill_on_drop(true)
+            .output()
+            .await?)
+    })
+    .await?;
+    if !output.status.success() {
+        anyhow::bail!("wine reg add exited with {}", output.status);
+    }
     Ok(())
 }
 

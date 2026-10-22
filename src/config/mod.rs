@@ -40,6 +40,8 @@ pub struct Config {
     pub bnet_args: Vec<String>,
     /// Environment variables for Battle.net
     pub bnet_env_vars: Vec<(String, String)>,
+    /// Battle.net UI scaling in percent (100 = no scaling), applied as Wine DPI
+    pub bnet_scale_percent: u32,
 
     // Prefix settings
     /// Drive letter mappings (letter, linux path) e.g. ("d", "/media/ssd")
@@ -226,6 +228,7 @@ impl Default for Config {
             wow_skip_default_args: false,
             bnet_args: vec!["--in-process-gpu".to_string()],
             bnet_env_vars: Vec::new(),
+            bnet_scale_percent: 100,
             drive_mappings: Vec::new(),
             mangohud_enabled: false,
             mangohud_config: String::new(),
@@ -252,7 +255,16 @@ impl Default for RunnerConfig {
     }
 }
 
+/// Scaling choices offered for the Battle.net client.
+pub const BNET_SCALE_OPTIONS: [u32; 5] = [100, 125, 150, 175, 200];
+
 impl Config {
+    /// Wine `LogPixels` value for the configured Battle.net scale (96 DPI = 100%).
+    #[must_use]
+    pub fn bnet_dpi(&self) -> u32 {
+        (96 * self.bnet_scale_percent.clamp(100, 400)).div_ceil(100)
+    }
+
     /// Load config from disk, or return default if not found.
     /// Migrates legacy `env_vars` to `wow_env_vars`.
     ///
@@ -434,6 +446,16 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bnet_dpi_follows_scale() {
+        let mut config = Config::default();
+        assert_eq!(config.bnet_dpi(), 96);
+        config.bnet_scale_percent = 150;
+        assert_eq!(config.bnet_dpi(), 144);
+        config.bnet_scale_percent = 200;
+        assert_eq!(config.bnet_dpi(), 192);
+    }
 
     #[test]
     fn defaults_include_retail_and_classic() {
