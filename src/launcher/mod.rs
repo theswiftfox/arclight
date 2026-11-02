@@ -1,8 +1,10 @@
 pub mod bnet;
 pub mod detect;
+pub mod flavors;
 pub mod process;
 pub mod proton_ge;
 pub mod steam;
+pub mod version;
 
 use std::{
     path::{Path, PathBuf},

@@ -1,4 +1,7 @@
-use std::collections::HashSet;
+use std::{
+    collections::{HashMap, HashSet},
+    time::Instant,
+};
 
 use iced::{
     Element, Font, Length, Subscription, Task, mouse,
@@ -18,6 +21,8 @@ use crate::{
     launcher::{
         bnet::{self, AuthStatus},
         detect::DetectedRunner,
+        flavors::{self, DetectedFlavor},
+        version::{self, ClientVersion, Latest, LatestKey},
     },
 };
 
@@ -168,6 +173,9 @@ pub enum Message {
     RemoveGameClientEnvVar(usize, usize),
     AddGameClient,
     RemoveGameClient(usize),
+    AddDetectedFlavor(String),
+    RescanFlavors,
+    CheckVersionsToggled(bool),
     BnetRunnerSelected(DetectedRunner),
     BnetRunnerReset,
     OnLaunchChanged(OnLaunchBehavior),
@@ -217,6 +225,9 @@ pub enum Message {
     OlderLogs,
     NewerLogs,
     ClearLogs,
+    // Versions and detected clients
+    VersionsChecked(u64, Result<version::Report, String>),
+    FlavorsDetected(u64, Result<Vec<DetectedFlavor>, String>),
     // Window events
     WindowCloseRequested(window::Id),
 }
@@ -273,6 +284,12 @@ pub struct App {
     install_task: Option<iced::task::Handle>,
     install_generation: u64,
     log_page: usize,
+    // Versions and detected clients
+    client_versions: HashMap<String, ClientVersion>,
+    latest_cache: HashMap<LatestKey, (Instant, Latest)>,
+    version_generation: u64,
+    detected_flavors: Vec<DetectedFlavor>,
+    flavor_generation: u64,
 }
 
 impl App {
@@ -339,6 +356,11 @@ impl App {
             install_task: None,
             install_generation: 0,
             log_page: 0,
+            client_versions: HashMap::new(),
+            latest_cache: HashMap::new(),
+            version_generation: 0,
+            detected_flavors: Vec::new(),
+            flavor_generation: 0,
         };
 
         // The stream owns its receiver for the app lifetime; UI callbacks never lock it.
@@ -363,6 +385,60 @@ impl App {
         let open_main = open.map(move |_| Message::MainWindowOpened(id));
         let task = Task::batch([Self::load_config_task(), log_task, open_main]);
         (app, task)
+    }
+
+    fn check_versions_task(&mut self) -> Task<Message> {
+        self.version_generation += 1;
+        let generation = self.version_generation;
+        let Some(root) = self.config.game_path.clone() else {
+            self.client_versions.clear();
+            return Task::none();
+        };
+        let now = Instant::now();
+        let fresh: std::collections::HashMap<_, _> = self
+            .latest_cache
+            .iter()
+            .filter(|(_, (fetched_at, _))| now.duration_since(*fetched_at) < version::CACHE_TTL)
+            .map(|(key, (_, latest))| (key.clone(), latest.clone()))
+            .collect();
+        let clients = self.config.game_clients.clone();
+        let region = self.config.region;
+        let network = self.config.check_versions;
+        Task::perform(
+            async move {
+                version::check(root, clients, region, network, fresh)
+                    .await
+                    .map_err(|error| format!("{error:#}"))
+            },
+            move |result| Message::VersionsChecked(generation, result),
+        )
+    }
+
+    fn rescan_flavors_task(&mut self) -> Task<Message> {
+        let input = self.game_path_input.trim();
+        let root = (!input.is_empty()).then(|| std::path::PathBuf::from(input));
+        self.detect_flavors_task(root)
+    }
+
+    fn detect_flavors_task(&mut self, root: Option<std::path::PathBuf>) -> Task<Message> {
+        self.flavor_generation += 1;
+        let generation = self.flavor_generation;
+        let Some(root) = root else {
+            self.detected_flavors.clear();
+            return Task::none();
+        };
+        Task::perform(
+            async move {
+                background::blocking(
+                    "Scanning for installed clients",
+                    DISCOVERY_TIMEOUT,
+                    move || Ok(flavors::detect_flavors(&root)),
+                )
+                .await
+                .map_err(|error| format!("{error:#}"))
+            },
+            move |result| Message::FlavorsDetected(generation, result),
+        )
     }
 
     fn load_config_task() -> Task<Message> {
@@ -643,7 +719,7 @@ impl App {
                     }
                     Err(error) => format!("Lost track of Battle.net: {error}"),
                 };
-                self.refresh_auth_task()
+                Task::batch([self.refresh_auth_task(), self.check_versions_task()])
             }
             Message::KillBnet if self.bnet_started && !self.killing_bnet => {
                 let Some(config) = self.bnet_config.clone() else {
@@ -810,7 +886,11 @@ impl App {
                         self.available_clients = discovery.available_clients;
                         self.loaded = true;
                         self.status = "Ready".into();
-                        self.refresh_auth_task()
+                        Task::batch([
+                            self.refresh_auth_task(),
+                            self.check_versions_task(),
+                            self.detect_flavors_task(self.config.game_path.clone()),
+                        ])
                     }
                     Err(error) => {
                         self.status = format!("Runner discovery failed: {error}");
@@ -818,6 +898,34 @@ impl App {
                     }
                 }
             }
+            Message::VersionsChecked(generation, result)
+                if generation == self.version_generation =>
+            {
+                match result {
+                    Ok(report) => {
+                        let now = Instant::now();
+                        self.latest_cache.extend(
+                            report
+                                .fetched
+                                .into_iter()
+                                .map(|(key, latest)| (key, (now, latest))),
+                        );
+                        self.client_versions = report.clients;
+                    }
+                    Err(error) => tracing::warn!("Version check failed: {error}"),
+                }
+                Task::none()
+            }
+            Message::FlavorsDetected(generation, result)
+                if generation == self.flavor_generation =>
+            {
+                match result {
+                    Ok(flavors) => self.detected_flavors = flavors,
+                    Err(error) => tracing::warn!("Scanning for installed clients failed: {error}"),
+                }
+                Task::none()
+            }
+            Message::VersionsChecked(..) | Message::FlavorsDetected(..) => Task::none(),
             Message::MainWindowOpened(id) => {
                 self.main_window_id = Some(id);
                 Task::none()
@@ -1161,8 +1269,12 @@ impl App {
         match message {
             Message::GamePathChanged(path) => self.game_path_input = path,
             Message::BrowsePath(target) => return self.browse_path(target),
-            Message::PathPicked(target, Some(path)) => self.apply_picked_path(target, &path),
-            Message::PathPicked(_, None) => {}
+            Message::PathPicked(target, Some(path)) => {
+                self.apply_picked_path(target, &path);
+                if matches!(target, PathTarget::GamePath) {
+                    return self.rescan_flavors_task();
+                }
+            }
             Message::RunnerSelected(runner) => {
                 self.config.runner.binary = Some(runner.path.clone());
                 self.config.runner.runner_type = runner.runner_type;
@@ -1249,6 +1361,19 @@ impl App {
                 };
                 self.config.game_clients.push(client);
             }
+            Message::AddDetectedFlavor(dir) => {
+                let flavor =
+                    flavors::unconfigured(&self.detected_flavors, &self.config.game_clients)
+                        .into_iter()
+                        .find(|flavor| flavor.dir == dir)
+                        .cloned();
+                if let Some(flavor) = flavor {
+                    let client = flavor.to_client(&self.config.game_clients);
+                    self.config.game_clients.push(client);
+                }
+            }
+            Message::RescanFlavors => return self.rescan_flavors_task(),
+            Message::CheckVersionsToggled(enabled) => self.config.check_versions = enabled,
             Message::RemoveGameClient(idx) => {
                 if idx < self.config.game_clients.len() {
                     self.config.game_clients.remove(idx);
@@ -1273,7 +1398,6 @@ impl App {
             Message::FocusPrevious if matches!(self.screen, Screen::Settings) => {
                 return iced::widget::operation::focus_previous().chain(reveal_focused());
             }
-            Message::FocusNext | Message::FocusPrevious => {}
             Message::JumpToSection(section) => {
                 use iced::widget::selector;
                 return selector::find(selector::id(section.id()))
@@ -1293,7 +1417,6 @@ impl App {
                     },
                 );
             }
-            Message::SectionScrollTarget(None) => {}
             Message::BnetScaleChanged(percent) => self.config.bnet_scale_percent = percent,
             Message::WowArgsChanged(args) => self.wow_args_input = args,
             Message::WowSkipDefaultArgsToggled(val) => self.config.wow_skip_default_args = val,
@@ -1517,6 +1640,38 @@ impl App {
         .into()
     }
 
+    fn view_version_info(&self, client: Option<&GameClient>) -> Element<'_, Message> {
+        let Some(info) = client.and_then(|client| self.client_versions.get(&client.id)) else {
+            return space().height(0).into();
+        };
+        let mut line = row![text(format!("installed {}", info.installed)).size(12)]
+            .spacing(8)
+            .align_y(iced::Alignment::Center);
+        if let Some(latest) = &info.latest {
+            line = line.push(text(format!("latest {latest}")).size(12));
+            if info.outdated {
+                let badge = container(text("!").size(12).color(iced::Color::BLACK))
+                    .center_x(18)
+                    .center_y(18)
+                    .style(|_theme: &iced::Theme| container::Style {
+                        background: Some(iced::Background::Color(theme::COLOR_WARNING)),
+                        border: iced::Border::default().rounded(9),
+                        ..Default::default()
+                    });
+                line = line.push(iced::widget::tooltip(
+                    badge,
+                    container(
+                        text(format!("Update available: {} → {latest}", info.installed)).size(12),
+                    )
+                    .padding(6)
+                    .style(container::rounded_box),
+                    iced::widget::tooltip::Position::Top,
+                ));
+            }
+        }
+        line.into()
+    }
+
     #[allow(clippy::too_many_lines)]
     fn view_main(&self) -> Element<'_, Message> {
         let title = text("ARCLIGHT").size(40);
@@ -1607,6 +1762,8 @@ impl App {
         .padding(8)
         .width(Length::Fixed(240.0));
 
+        let version_info = self.view_version_info(selected_client);
+
         let launch_btn = if self.wow_running {
             row![
                 button(
@@ -1674,6 +1831,7 @@ impl App {
             auth_row,
             space().height(20),
             client_picker,
+            version_info,
             launch_btn,
             space().height(12),
             status,
@@ -1766,6 +1924,10 @@ impl App {
         )
         .padding(8)
         .width(Length::Fill);
+
+        let check_versions_checkbox = checkbox(self.config.check_versions)
+            .label("Check for newer game versions (asks Blizzard's public version service)")
+            .on_toggle(Message::CheckVersionsToggled);
 
         let clients_header = section_header(SettingsSection::Clients);
         let mut clients_column = column![].spacing(12);
@@ -1866,6 +2028,29 @@ impl App {
         let add_client = button("+ Add Client")
             .padding([6, 12])
             .on_press(Message::AddGameClient);
+        let rescan_clients = button("Rescan install")
+            .padding([6, 12])
+            .style(button::secondary)
+            .on_press(Message::RescanFlavors);
+        let mut detected_clients = column![].spacing(6);
+        let missing = flavors::unconfigured(&self.detected_flavors, &self.config.game_clients);
+        if !missing.is_empty() {
+            detected_clients = detected_clients.push(text("Found in the install folder:").size(14));
+            for flavor in missing {
+                detected_clients = detected_clients.push(
+                    button(
+                        text(format!(
+                            "+ Add {} ({})",
+                            flavor.name,
+                            flavor.executable.display()
+                        ))
+                        .size(13),
+                    )
+                    .padding([4, 12])
+                    .on_press(Message::AddDetectedFlavor(flavor.dir.clone())),
+                );
+            }
+        }
 
         // Drive Mappings Section
         let drive_header = section_header(SettingsSection::Drives);
@@ -2020,11 +2205,14 @@ impl App {
             space().height(8),
             on_launch_label,
             on_launch_picker,
+            space().height(8),
+            check_versions_checkbox,
             space().height(16),
             clients_header,
             clients_column,
             space().height(4),
-            add_client,
+            row![add_client, rescan_clients].spacing(8),
+            detected_clients,
             space().height(16),
             // Drive mappings section
             drive_header,

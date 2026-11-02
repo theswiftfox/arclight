@@ -9,6 +9,11 @@ Arclight manages Wine/Proton runners, Battle.net installation, and game launchin
 - Auto-detect or manually select Wine/Proton-GE runners
 - Install and launch Battle.net within a managed Wine prefix
 - Launch Retail, Classic, and user-defined WoW clients from one install root
+- Show installed and latest game versions, with a warning when a client is out of date. Installed
+  versions come from the install's `.build.info`; the latest comes from one read-only request per
+  product to Blizzard's public version service (`<region>.version.battle.net`), cached for 30
+  minutes and switchable off in Settings. Arclight never downloads or patches game files.
+- Detect installed flavors (PTR, Beta, Classic Era, ...) in the install folder and offer to add them as clients
 - Configure per-client executables, Wine/Proton runners, prefixes, arguments, and environment variables
 
 ## Building

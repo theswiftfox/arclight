@@ -23,6 +23,8 @@ pub struct Config {
     pub on_launch: OnLaunchBehavior,
     /// Auto-check for updates on launch
     pub auto_update: bool,
+    /// Ask Blizzard's version service whether installed clients are out of date
+    pub check_versions: bool,
 
     // WoW launch settings
     /// Additional launch arguments for `WoW`
@@ -202,6 +204,19 @@ impl std::fmt::Display for OnLaunchBehavior {
     }
 }
 
+impl Region {
+    /// Lowercase code used by Blizzard's services (`.build.info` branch, version service).
+    #[must_use]
+    pub fn code(self) -> &'static str {
+        match self {
+            Region::US => "us",
+            Region::EU => "eu",
+            Region::KR => "kr",
+            Region::TW => "tw",
+        }
+    }
+}
+
 impl std::fmt::Display for Region {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -223,6 +238,7 @@ impl Default for Config {
             region: Region::EU,
             on_launch: OnLaunchBehavior::Minimize,
             auto_update: true,
+            check_versions: true,
             wow_args: Vec::new(),
             wow_env_vars: Vec::new(),
             wow_skip_default_args: false,

@@ -3,6 +3,7 @@ use iced::{Color, Theme, theme::palette::Palette};
 /// WoW-inspired color constants for use outside the palette (e.g. status indicators).
 pub const COLOR_SUCCESS: Color = Color::from_rgb(0.118, 1.0, 0.0); // #1eff00 — WoW uncommon green
 pub const COLOR_DANGER: Color = Color::from_rgb(1.0, 0.2, 0.2); // #ff3333 — WoW red
+pub const COLOR_WARNING: Color = Color::from_rgb(1.0, 0.8, 0.2); // #ffcc33 — matches the palette warning
 pub const COLOR_TITLEBAR: Color = Color::from_rgb(0.067, 0.067, 0.133); // #111122 — darker than background
 
 /// Create a WoW-inspired custom theme.
