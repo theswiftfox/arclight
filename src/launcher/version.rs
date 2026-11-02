@@ -256,16 +256,20 @@ pub async fn check<S: std::hash::BuildHasher>(
 mod tests {
     use super::*;
 
-    const BUILD_INFO: &str = "Branch!STRING:0|Active!DEC:1|Build Key!HEX:16|CDN Key!HEX:16|Install Key!HEX:16|IM Size!DEC:4|CDN Path!STRING:0|CDN Hosts!STRING:0|CDN Servers!STRING:0|Tags!STRING:0|Armadillo!STRING:0|Last Activated!STRING:0|Version!STRING:0|KeyRing!HEX:16|Product!STRING:0\n\
-eu|1|5604ce35|c74a0a5a|||tpr/wow|level3.blizzard.com|http://level3.blizzard.com/|Windows x86_64 EU? acct-DEU?|||1.15.9.70576||wow_classic_era\n\
-us|1|ad1802f4|c74a0a5a|||tpr/wow|level3.blizzard.com|http://level3.blizzard.com/|Windows x86_64 US?|||1.60.1.70532||wow_classic_beta\n\
-eu|1|7feb61f3|c74a0a5a|||tpr/wow|level3.blizzard.com|http://level3.blizzard.com/|Windows x86_64 EU?|||1.60.1.70707||wowf\n\
-us|0|00000000|c74a0a5a|||tpr/wow|level3.blizzard.com|http://level3.blizzard.com/|Windows x86_64 US?|||11.0.0.1||wow\n";
+    const BUILD_INFO: &str = concat!(
+        "Branch!STRING:0|Active!DEC:1|Tags!STRING:0|Version!STRING:0|Product!STRING:0\n",
+        "eu|1|Windows x86_64 EU?|1.15.9.70576|wow_classic_era\n",
+        "us|1|Windows x86_64 US?|1.60.1.70532|wow_classic_beta\n",
+        "eu|1|Windows x86_64 EU?|1.60.1.70707|wowf\n",
+        "us|0|Windows x86_64 US?|11.0.0.1|wow\n",
+    );
 
-    const VERSIONS: &str = "Region!STRING:0|BuildConfig!HEX:16|CDNConfig!HEX:16|KeyRing!HEX:\
-                            16|BuildId!DEC:4|VersionsName!String:0|ProductConfig!HEX:16\n## seqn \
-                            = 4111171\nus|5604ce35|c74a0a5a||70576|1.15.9.70576|c9934edf\\
-                            neu|5604ce35|c74a0a5a||70580|1.15.9.70580|c9934edf\n";
+    const VERSIONS: &str = concat!(
+        "Region!STRING:0|BuildId!DEC:4|VersionsName!String:0\n",
+        "## seqn = 4111171\n",
+        "us|70576|1.15.9.70576\n",
+        "eu|70580|1.15.9.70580\n",
+    );
 
     fn latest(version: &str) -> Latest {
         Latest {
@@ -295,8 +299,11 @@ us|0|00000000|c74a0a5a|||tpr/wow|level3.blizzard.com|http://level3.blizzard.com/
 
     #[test]
     fn configured_region_wins_when_a_product_has_several_rows() {
-        let text = "Branch!STRING:0|Active!DEC:1|Version!STRING:0|Product!STRING:0\nus|1|1.0.0.\
-                    100|wow\neu|1|1.0.0.200|wow\n";
+        let text = concat!(
+            "Branch!STRING:0|Active!DEC:1|Version!STRING:0|Product!STRING:0\n",
+            "us|1|1.0.0.100|wow\n",
+            "eu|1|1.0.0.200|wow\n",
+        );
         let installed = installed_from_build_info(text);
 
         assert_eq!(
@@ -315,8 +322,11 @@ us|0|00000000|c74a0a5a|||tpr/wow|level3.blizzard.com|http://level3.blizzard.com/
 
     #[test]
     fn rows_with_unsafe_values_are_ignored() {
-        let text = "Branch!STRING:0|Active!DEC:1|Version!STRING:0|Product!STRING:0\neu|1|1.0.0.1|.\
-                    ./evil\neu.evil.com|1|1.0.0.1|wow\n";
+        let text = concat!(
+            "Branch!STRING:0|Active!DEC:1|Version!STRING:0|Product!STRING:0\n",
+            "eu|1|1.0.0.1|../evil\n",
+            "eu.evil.com|1|1.0.0.1|wow\n",
+        );
 
         assert!(installed_from_build_info(text).is_empty());
     }

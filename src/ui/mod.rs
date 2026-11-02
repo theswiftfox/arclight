@@ -15,10 +15,12 @@ use iced::{
 use crate::{
     background::{self, DISCOVERY_TIMEOUT, IO_TIMEOUT},
     config::{
-        BNET_SCALE_OPTIONS, Config, GameClient, OnLaunchBehavior, RunnerOverride, RunnerType,
+        BNET_SCALE_OPTIONS, Config, GameClient, OnLaunchBehavior, ProtonFlag, RunnerOverride,
+        RunnerType,
     },
     launcher,
     launcher::{
+        artwork,
         bnet::{self, AuthStatus},
         detect::DetectedRunner,
         flavors::{self, DetectedFlavor},
@@ -27,12 +29,76 @@ use crate::{
 };
 
 pub mod logs;
+mod main_view;
 pub mod theme;
 
 pub use theme::wow_theme;
 
+/// Per-client choice for a Proton toggle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtonChoice {
+    UseGlobal,
+    On,
+    Off,
+}
+
+impl ProtonChoice {
+    const ALL: [Self; 3] = [Self::UseGlobal, Self::On, Self::Off];
+}
+
+impl From<Option<bool>> for ProtonChoice {
+    fn from(value: Option<bool>) -> Self {
+        match value {
+            None => Self::UseGlobal,
+            Some(true) => Self::On,
+            Some(false) => Self::Off,
+        }
+    }
+}
+
+impl From<ProtonChoice> for Option<bool> {
+    fn from(value: ProtonChoice) -> Self {
+        match value {
+            ProtonChoice::UseGlobal => None,
+            ProtonChoice::On => Some(true),
+            ProtonChoice::Off => Some(false),
+        }
+    }
+}
+
+impl std::fmt::Display for ProtonChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::UseGlobal => "Use global",
+            Self::On => "On",
+            Self::Off => "Off",
+        })
+    }
+}
+
 const SETTINGS_SCROLL_ID: &str = "settings-scroll";
 const SETTINGS_CONTENT_ID: &str = "settings-content";
+
+/// Where to scroll when Settings is opened from another screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsTarget {
+    Section(SettingsSection),
+    /// The card of the game client at this index
+    Client(usize),
+}
+
+impl SettingsTarget {
+    fn id(self) -> String {
+        match self {
+            Self::Section(section) => section.id().to_owned(),
+            Self::Client(idx) => client_card_id(idx),
+        }
+    }
+}
+
+fn client_card_id(idx: usize) -> String {
+    format!("settings-client-{idx}")
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsSection {
@@ -92,6 +158,8 @@ pub enum PathTarget {
     ClientExecutable(usize),
     ClientPrefix(usize),
     DriveMapping(usize),
+    Background,
+    ClientBackground(usize),
 }
 
 #[must_use]
@@ -111,6 +179,13 @@ const EMOJI_FONT: Font = Font {
 pub enum Screen {
     Main,
     Settings,
+}
+
+/// A client tab being dragged to a new position.
+#[derive(Debug, Clone)]
+struct TabDrag {
+    id: String,
+    moved: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -135,11 +210,18 @@ pub enum Message {
     WindowClose(window::Id),
     // Navigation
     GoToSettings,
+    OpenSettings(SettingsTarget),
+    JumpTo(SettingsTarget),
     GoToMain,
     // Launch
     Launch,
     GameClientSelected(GameClient),
     GameClientSelectionSaved(Result<(), String>),
+    ClientTabPressed(String),
+    ClientTabEntered(String),
+    ClientTabExited(String),
+    ClientTabReleased,
+    ClientOrderSaved(Result<(), String>),
     LaunchResult(Result<(), String>),
     WowExited(u64, Result<(), String>),
     KillWow,
@@ -170,12 +252,22 @@ pub enum Message {
     GameClientEnvKeyChanged(usize, usize, String),
     GameClientEnvValueChanged(usize, usize, String),
     AddGameClientEnvVar(usize),
+    GlobalEnvKeyChanged(usize, String),
+    GlobalEnvValueChanged(usize, String),
+    AddGlobalEnvVar,
+    RemoveGlobalEnvVar(usize),
+    BnetUseGlobalEnvToggled(bool),
+    GlobalProtonToggled(ProtonFlag, bool),
+    GameClientProtonChanged(usize, ProtonFlag, ProtonChoice),
     RemoveGameClientEnvVar(usize, usize),
     AddGameClient,
     RemoveGameClient(usize),
+    GameClientBackgroundChanged(usize, String),
+    BackgroundChanged(String),
     AddDetectedFlavor(String),
     RescanFlavors,
     CheckVersionsToggled(bool),
+    OfficialArtworkToggled(bool),
     BnetRunnerSelected(DetectedRunner),
     BnetRunnerReset,
     OnLaunchChanged(OnLaunchBehavior),
@@ -228,6 +320,8 @@ pub enum Message {
     // Versions and detected clients
     VersionsChecked(u64, Result<version::Report, String>),
     FlavorsDetected(u64, Result<Vec<DetectedFlavor>, String>),
+    ArtworkLoaded(u64, Result<HashMap<String, std::path::PathBuf>, String>),
+    BnetIconFound(Option<std::path::PathBuf>),
     // Window events
     WindowCloseRequested(window::Id),
 }
@@ -290,6 +384,12 @@ pub struct App {
     version_generation: u64,
     detected_flavors: Vec<DetectedFlavor>,
     flavor_generation: u64,
+    official_art: HashMap<String, std::path::PathBuf>,
+    bnet_icon: Option<std::path::PathBuf>,
+    tab_drag: Option<TabDrag>,
+    hovered_tab: Option<String>,
+    art_generation: u64,
+    art_applied: u64,
 }
 
 impl App {
@@ -361,6 +461,12 @@ impl App {
             version_generation: 0,
             detected_flavors: Vec::new(),
             flavor_generation: 0,
+            official_art: HashMap::new(),
+            bnet_icon: None,
+            tab_drag: None,
+            hovered_tab: None,
+            art_generation: 0,
+            art_applied: 0,
         };
 
         // The stream owns its receiver for the app lifetime; UI callbacks never lock it.
@@ -372,8 +478,8 @@ impl App {
             },
         ));
         let (id, open) = iced::window::open(iced::window::Settings {
-            size: iced::Size::new(800.0, 650.0),
-            min_size: Some(iced::Size::new(700.0, 600.0)),
+            size: iced::Size::new(1100.0, 700.0),
+            min_size: Some(iced::Size::new(900.0, 600.0)),
             resizable: true,
             decorations: false,
             platform_specific: iced::window::settings::PlatformSpecific {
@@ -412,6 +518,39 @@ impl App {
             },
             move |result| Message::VersionsChecked(generation, result),
         )
+    }
+
+    fn artwork_task(&mut self) -> Task<Message> {
+        let Some(root) = self.config.game_path.clone() else {
+            self.official_art.clear();
+            return Task::none();
+        };
+        if !self.config.official_artwork {
+            self.official_art.clear();
+            return Task::none();
+        }
+        let clients = self.config.game_clients.clone();
+        self.art_generation += 1;
+        let cached_generation = self.art_generation;
+        self.art_generation += 1;
+        let refreshed_generation = self.art_generation;
+        let (cached_root, cached_clients) = (root.clone(), clients.clone());
+        Task::perform(
+            async move {
+                artwork::cached(cached_root, cached_clients)
+                    .await
+                    .map_err(|error| format!("{error:#}"))
+            },
+            move |result| Message::ArtworkLoaded(cached_generation, result),
+        )
+        .chain(Task::perform(
+            async move {
+                artwork::refresh(root, clients)
+                    .await
+                    .map_err(|error| format!("{error:#}"))
+            },
+            move |result| Message::ArtworkLoaded(refreshed_generation, result),
+        ))
     }
 
     fn rescan_flavors_task(&mut self) -> Task<Message> {
@@ -462,7 +601,20 @@ impl App {
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
+        // Only listen for the end of a drag while one is running. Leaving the window
+        // also ends it, because the release may never be delivered there.
+        let drag_end = if self.tab_drag.is_some() {
+            iced::event::listen_with(|event, _status, _window| match event {
+                iced::Event::Mouse(
+                    mouse::Event::ButtonReleased(mouse::Button::Left) | mouse::Event::CursorLeft,
+                ) => Some(Message::ClientTabReleased),
+                _ => None,
+            })
+        } else {
+            Subscription::none()
+        };
         Subscription::batch([
+            drag_end,
             iced::window::close_requests().map(Message::WindowCloseRequested),
             iced::event::listen_with(|event, _status, _window| match event {
                 iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
@@ -557,6 +709,17 @@ impl App {
                 self.screen = Screen::Settings;
                 Task::none()
             }
+            Message::OpenSettings(target) if self.loaded => {
+                self.settings_snapshot = Some(self.snapshot_settings());
+                self.screen = Screen::Settings;
+                // The target only exists once the Settings screen has been drawn.
+                Task::perform(
+                    async {
+                        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                    },
+                    move |()| Message::JumpTo(target),
+                )
+            }
             Message::GoToMain => {
                 if !self.saving
                     && let Some(snapshot) = self.settings_snapshot.take()
@@ -578,6 +741,56 @@ impl App {
                     },
                     Message::GameClientSelectionSaved,
                 )
+            }
+            Message::ClientTabPressed(id) if self.loaded => {
+                self.tab_drag = Some(TabDrag {
+                    id: id.clone(),
+                    moved: false,
+                });
+                let client = self
+                    .config
+                    .game_clients
+                    .iter()
+                    .find(|client| client.id == id && client.id != self.config.selected_game_client)
+                    .cloned();
+                client.map_or_else(Task::none, |client| {
+                    self.update(Message::GameClientSelected(client))
+                })
+            }
+            Message::ClientTabEntered(id) => {
+                if let Some(drag) = &mut self.tab_drag
+                    && move_client(&mut self.config.game_clients, &drag.id, &id)
+                {
+                    drag.moved = true;
+                }
+                self.hovered_tab = Some(id);
+                Task::none()
+            }
+            Message::ClientTabExited(id) => {
+                if self.hovered_tab.as_ref() == Some(&id) {
+                    self.hovered_tab = None;
+                }
+                Task::none()
+            }
+            Message::ClientTabReleased => match self.tab_drag.take() {
+                Some(drag) if drag.moved => {
+                    let config = self.config.clone();
+                    Task::perform(
+                        async move {
+                            background::mutation("Saving client order", move || config.save())
+                                .await
+                                .map_err(|error| error.to_string())
+                        },
+                        Message::ClientOrderSaved,
+                    )
+                }
+                _ => Task::none(),
+            },
+            Message::ClientOrderSaved(result) => {
+                if let Err(error) = result {
+                    self.status = format!("Could not save client order: {error}");
+                }
+                Task::none()
             }
             Message::GameClientSelectionSaved(result) => {
                 if let Err(error) = result {
@@ -800,9 +1013,16 @@ impl App {
             {
                 self.auth_busy = false;
                 match result {
-                    Ok(status) => self.auth_status = status,
+                    Ok(status) => {
+                        self.auth_status = status;
+                        return self.bnet_icon_task();
+                    }
                     Err(error) => self.status = format!("Auth check failed: {error}"),
                 }
+                Task::none()
+            }
+            Message::BnetIconFound(icon) => {
+                self.bnet_icon = icon;
                 Task::none()
             }
             Message::SaveSettings => self.handle_save_settings(),
@@ -886,10 +1106,13 @@ impl App {
                         self.available_clients = discovery.available_clients;
                         self.loaded = true;
                         self.status = "Ready".into();
+                        // `background::blocking` rejects work beyond its worker limit, so
+                        // the follow-up jobs run in sequential chains.
+                        let flavors = self.detect_flavors_task(self.config.game_path.clone());
                         Task::batch([
                             self.refresh_auth_task(),
-                            self.check_versions_task(),
-                            self.detect_flavors_task(self.config.game_path.clone()),
+                            self.check_versions_task().chain(flavors),
+                            self.artwork_task(),
                         ])
                     }
                     Err(error) => {
@@ -925,7 +1148,19 @@ impl App {
                 }
                 Task::none()
             }
-            Message::VersionsChecked(..) | Message::FlavorsDetected(..) => Task::none(),
+            Message::ArtworkLoaded(generation, result) if generation > self.art_applied => {
+                match result {
+                    Ok(paths) => {
+                        self.art_applied = generation;
+                        self.official_art = paths;
+                    }
+                    Err(error) => tracing::warn!("Artwork lookup failed: {error}"),
+                }
+                Task::none()
+            }
+            Message::VersionsChecked(..)
+            | Message::FlavorsDetected(..)
+            | Message::ArtworkLoaded(..) => Task::none(),
             Message::MainWindowOpened(id) => {
                 self.main_window_id = Some(id);
                 Task::none()
@@ -1140,6 +1375,9 @@ impl App {
         for client in &mut self.config.game_clients {
             client.env_vars.retain(|(key, _)| !key.is_empty());
         }
+        self.config
+            .global_env_vars
+            .retain(|(key, _)| !key.is_empty());
         self.config.ensure_selected_client();
 
         let config = self.config.clone();
@@ -1173,6 +1411,10 @@ impl App {
 
     fn browse_path(&self, target: PathTarget) -> Task<Message> {
         let game_root = std::path::PathBuf::from(self.game_path_input.trim());
+        let is_image = matches!(
+            target,
+            PathTarget::Background | PathTarget::ClientBackground(_)
+        );
         let (title, pick_files, current) = match target {
             PathTarget::GamePath => (
                 "Select WoW install folder",
@@ -1206,6 +1448,23 @@ impl App {
                     .get(idx)
                     .map_or_else(String::new, |(_, p)| p.clone()),
             ),
+            PathTarget::Background => (
+                "Select background image",
+                true,
+                self.config
+                    .background_image
+                    .as_ref()
+                    .map_or_else(String::new, |p| p.to_string_lossy().into_owned()),
+            ),
+            PathTarget::ClientBackground(idx) => (
+                "Select background image",
+                true,
+                self.config
+                    .game_clients
+                    .get(idx)
+                    .and_then(|c| c.background.as_ref())
+                    .map_or_else(String::new, |p| p.to_string_lossy().into_owned()),
+            ),
         };
         let mut start = std::path::PathBuf::from(current.trim());
         while !start.as_os_str().is_empty() && !start.is_dir() {
@@ -1217,6 +1476,9 @@ impl App {
         Task::perform(
             async move {
                 let mut dialog = rfd::AsyncFileDialog::new().set_title(title);
+                if is_image {
+                    dialog = dialog.add_filter("Images", &["jpg", "jpeg", "png", "webp"]);
+                }
                 if start.is_dir() {
                     dialog = dialog.set_directory(start);
                 }
@@ -1256,6 +1518,12 @@ impl App {
             PathTarget::DriveMapping(idx) => {
                 if let Some(entry) = self.drive_mappings.get_mut(idx) {
                     entry.1 = path.to_string_lossy().into_owned();
+                }
+            }
+            PathTarget::Background => self.config.background_image = Some(path.to_path_buf()),
+            PathTarget::ClientBackground(idx) => {
+                if let Some(client) = self.config.game_clients.get_mut(idx) {
+                    client.background = Some(path.to_path_buf());
                 }
             }
         }
@@ -1361,6 +1629,12 @@ impl App {
                 };
                 self.config.game_clients.push(client);
             }
+            Message::GameClientBackgroundChanged(idx, path) => {
+                if let Some(client) = self.config.game_clients.get_mut(idx) {
+                    client.background = optional_path(&path);
+                }
+            }
+            Message::BackgroundChanged(path) => self.config.background_image = optional_path(&path),
             Message::AddDetectedFlavor(dir) => {
                 let flavor =
                     flavors::unconfigured(&self.detected_flavors, &self.config.game_clients)
@@ -1374,6 +1648,7 @@ impl App {
             }
             Message::RescanFlavors => return self.rescan_flavors_task(),
             Message::CheckVersionsToggled(enabled) => self.config.check_versions = enabled,
+            Message::OfficialArtworkToggled(enabled) => self.config.official_artwork = enabled,
             Message::RemoveGameClient(idx) => {
                 if idx < self.config.game_clients.len() {
                     self.config.game_clients.remove(idx);
@@ -1399,14 +1674,10 @@ impl App {
                 return iced::widget::operation::focus_previous().chain(reveal_focused());
             }
             Message::JumpToSection(section) => {
-                use iced::widget::selector;
-                return selector::find(selector::id(section.id()))
-                    .then(|target| match target {
-                        Some(section) => selector::find(selector::id(SETTINGS_CONTENT_ID))
-                            .map(move |top| top.map(|top| section.bounds().y - top.bounds().y)),
-                        None => Task::done(None),
-                    })
-                    .map(Message::SectionScrollTarget);
+                return scroll_to_target(SettingsTarget::Section(section));
+            }
+            Message::JumpTo(target) if matches!(self.screen, Screen::Settings) => {
+                return scroll_to_target(target);
             }
             Message::SectionScrollTarget(Some(y)) => {
                 return iced::widget::operation::scroll_to(
@@ -1418,6 +1689,37 @@ impl App {
                 );
             }
             Message::BnetScaleChanged(percent) => self.config.bnet_scale_percent = percent,
+            Message::BnetUseGlobalEnvToggled(enabled) => {
+                self.config.bnet_use_global_env = enabled;
+            }
+            Message::GlobalProtonToggled(flag, enabled) => {
+                self.config.global_proton.set(flag, enabled);
+            }
+            Message::GameClientProtonChanged(idx, flag, choice) => {
+                if let Some(client) = self.config.game_clients.get_mut(idx) {
+                    client.proton.set(flag, choice.into());
+                }
+            }
+            Message::GlobalEnvKeyChanged(idx, key) => {
+                if let Some(entry) = self.config.global_env_vars.get_mut(idx) {
+                    entry.0 = key;
+                }
+            }
+            Message::GlobalEnvValueChanged(idx, value) => {
+                if let Some(entry) = self.config.global_env_vars.get_mut(idx) {
+                    entry.1 = value;
+                }
+            }
+            Message::AddGlobalEnvVar => {
+                self.config
+                    .global_env_vars
+                    .push((String::new(), String::new()));
+            }
+            Message::RemoveGlobalEnvVar(idx) => {
+                if idx < self.config.global_env_vars.len() {
+                    self.config.global_env_vars.remove(idx);
+                }
+            }
             Message::WowArgsChanged(args) => self.wow_args_input = args,
             Message::WowSkipDefaultArgsToggled(val) => self.config.wow_skip_default_args = val,
             Message::WowEnvKeyChanged(idx, key) => {
@@ -1475,6 +1777,25 @@ impl App {
             _ => {}
         }
         Task::none()
+    }
+
+    /// Look up the installed Battle.net's icon (and drop it once Battle.net is gone).
+    fn bnet_icon_task(&mut self) -> Task<Message> {
+        if self.auth_status == AuthStatus::NotInstalled {
+            self.bnet_icon = None;
+            return Task::none();
+        }
+        let config = self.config.clone();
+        Task::perform(
+            async move {
+                background::blocking("Finding the Battle.net icon", IO_TIMEOUT, move || {
+                    Ok(bnet::find_icon(&config))
+                })
+                .await
+                .unwrap_or_default()
+            },
+            Message::BnetIconFound,
+        )
     }
 
     fn refresh_auth_task(&mut self) -> Task<Message> {
@@ -1640,219 +1961,6 @@ impl App {
         .into()
     }
 
-    fn view_version_info(&self, client: Option<&GameClient>) -> Element<'_, Message> {
-        let Some(info) = client.and_then(|client| self.client_versions.get(&client.id)) else {
-            return space().height(0).into();
-        };
-        let mut line = row![text(format!("installed {}", info.installed)).size(12)]
-            .spacing(8)
-            .align_y(iced::Alignment::Center);
-        if let Some(latest) = &info.latest {
-            line = line.push(text(format!("latest {latest}")).size(12));
-            if info.outdated {
-                let badge = container(text("!").size(12).color(iced::Color::BLACK))
-                    .center_x(18)
-                    .center_y(18)
-                    .style(|_theme: &iced::Theme| container::Style {
-                        background: Some(iced::Background::Color(theme::COLOR_WARNING)),
-                        border: iced::Border::default().rounded(9),
-                        ..Default::default()
-                    });
-                line = line.push(iced::widget::tooltip(
-                    badge,
-                    container(
-                        text(format!("Update available: {} → {latest}", info.installed)).size(12),
-                    )
-                    .padding(6)
-                    .style(container::rounded_box),
-                    iced::widget::tooltip::Position::Top,
-                ));
-            }
-        }
-        line.into()
-    }
-
-    #[allow(clippy::too_many_lines)]
-    fn view_main(&self) -> Element<'_, Message> {
-        let title = text("ARCLIGHT").size(40);
-        let subtitle = text("World of Warcraft Launcher").size(16);
-
-        // Auth status indicator
-        let (auth_color, auth_text) = match &self.auth_status {
-            AuthStatus::NotInstalled => {
-                (theme::COLOR_DANGER, "Battle.net not installed".to_string())
-            }
-            AuthStatus::NotLoggedIn => (theme::COLOR_DANGER, "Not logged in".to_string()),
-            AuthStatus::BnetLoggedIn => (theme::COLOR_SUCCESS, "Battle.net logged in".to_string()),
-            AuthStatus::WowReady { game_account } => (
-                theme::COLOR_SUCCESS,
-                format!("Battle.net logged in ({game_account})"),
-            ),
-        };
-
-        let auth_row = {
-            let indicator = container(text("").size(1)).width(12).height(12).style(
-                move |_theme: &iced::Theme| container::Style {
-                    background: Some(iced::Background::Color(auth_color)),
-                    border: iced::Border::default().rounded(6),
-                    ..Default::default()
-                },
-            );
-            let status_text = text(auth_text).size(12);
-
-            let mut btn_row = row![].spacing(8);
-
-            if self.installing {
-                btn_row = btn_row.push(
-                    button("Cancel installation")
-                        .padding([6, 16])
-                        .on_press(Message::CancelInstall),
-                );
-            } else if self.bnet_busy {
-                btn_row = btn_row.push(button("Battle.net running...").padding([6, 16]));
-                btn_row = btn_row.push(button("Force Quit").padding([6, 16]).on_press_maybe(
-                    (self.bnet_started && !self.killing_bnet).then_some(Message::KillBnet),
-                ));
-            } else if self.auth_status == AuthStatus::NotInstalled {
-                btn_row = btn_row.push(
-                    button("Install Battle.net")
-                        .padding([6, 16])
-                        .on_press(Message::InstallBnet),
-                );
-            } else {
-                btn_row = btn_row.push(
-                    button("Launch Battle.net")
-                        .padding([6, 16])
-                        .on_press(Message::LaunchBnet),
-                );
-            }
-
-            let refresh_btn = button("Refresh")
-                .padding([6, 12])
-                .on_press_maybe((!self.auth_busy).then_some(Message::RefreshAuthStatus));
-
-            row![
-                indicator,
-                status_text,
-                space().width(Length::Fill),
-                btn_row,
-                refresh_btn
-            ]
-            .spacing(8)
-            .align_y(iced::Alignment::Center)
-        };
-
-        let status = text(&self.status).size(14);
-
-        let selected_client = self.config.selected_client();
-        let can_play = selected_client
-            .is_some_and(|client| self.available_clients.contains(&client.id))
-            && !self.launching
-            && !self.wow_running
-            && !self.killing_wow
-            && !self.saving
-            && !self.installing;
-
-        let client_picker = pick_list(
-            self.config.game_clients.clone(),
-            selected_client.cloned(),
-            Message::GameClientSelected,
-        )
-        .placeholder("Select a game client")
-        .padding(8)
-        .width(Length::Fixed(240.0));
-
-        let version_info = self.view_version_info(selected_client);
-
-        let launch_btn = if self.wow_running {
-            row![
-                button(
-                    text(format!(
-                        "{} is running",
-                        self.wow_client
-                            .as_ref()
-                            .map_or("WoW", |client| &client.name)
-                    ))
-                    .size(16)
-                )
-                .padding([12, 32]),
-                button("Force Quit")
-                    .padding([12, 24])
-                    .on_press_maybe((!self.killing_wow).then_some(Message::KillWow)),
-            ]
-            .spacing(8)
-        } else {
-            row![if can_play {
-                button(text("Play").size(24))
-                    .padding([12, 48])
-                    .on_press(Message::Launch)
-            } else {
-                button(text("Play").size(24)).padding([12, 48])
-            }]
-        };
-
-        let settings_btn = button(
-            row![text("⚙").font(EMOJI_FONT).size(16), text("Settings")]
-                .spacing(6)
-                .align_y(iced::Alignment::Center),
-        )
-        .padding([8, 20])
-        .on_press(Message::GoToSettings);
-
-        let logs_btn = button("View Logs")
-            .padding([8, 20])
-            .on_press(Message::OpenLogs);
-
-        let runner_info = text(effective_runner_label(
-            selected_client,
-            self.selected_runner.as_ref(),
-            self.automatic_runner.as_ref(),
-            &self.detected_runners,
-        ))
-        .size(12);
-
-        let game_path_info =
-            if let (Some(path), Some(client)) = (&self.config.game_path, selected_client) {
-                let executable = path.join(&client.executable);
-                let availability = if self.available_clients.contains(&client.id) {
-                    ""
-                } else {
-                    " (not found)"
-                };
-                text(format!("Game: {}{}", executable.display(), availability)).size(12)
-            } else {
-                text("Game path not set — configure in Settings".to_string()).size(12)
-            };
-
-        let content = column![
-            title,
-            subtitle,
-            space().height(20),
-            auth_row,
-            space().height(20),
-            client_picker,
-            version_info,
-            launch_btn,
-            space().height(12),
-            status,
-            space().height(Length::Fill),
-            game_path_info,
-            runner_info,
-            row![settings_btn, logs_btn].spacing(8),
-        ]
-        .align_x(iced::Alignment::Center)
-        .spacing(8)
-        .padding(40)
-        .width(Length::Fill);
-
-        container(content)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center_x(Length::Fill)
-            .center_y(Length::Fill)
-            .into()
-    }
-
     #[allow(clippy::too_many_lines)]
     fn view_settings(&self) -> Element<'_, Message> {
         // Top bar
@@ -1925,9 +2033,72 @@ impl App {
         .padding(8)
         .width(Length::Fill);
 
+        let background_label = text("Default background image (optional):").size(14);
+        let background_field = row![
+            text_input(
+                "/path/to/image.jpg",
+                &path_text(self.config.background_image.as_ref())
+            )
+            .on_input(Message::BackgroundChanged)
+            .padding(8)
+            .width(Length::Fill),
+            browse_button(PathTarget::Background),
+        ]
+        .spacing(4)
+        .align_y(iced::Alignment::Center);
+
         let check_versions_checkbox = checkbox(self.config.check_versions)
             .label("Check for newer game versions (asks Blizzard's public version service)")
             .on_toggle(Message::CheckVersionsToggled);
+        let official_artwork_checkbox = checkbox(self.config.official_artwork)
+            .label(
+                "Show official artwork from the WoW game pages (about one image per client, \
+                 checked weekly)",
+            )
+            .on_toggle(Message::OfficialArtworkToggled);
+
+        let global_env_label = text(
+            "Global environment variables (applied to all clients; a client's own variables \
+             override them):",
+        )
+        .size(14);
+        let mut global_env_col = column![].spacing(4);
+        for (idx, (key, value)) in self.config.global_env_vars.iter().enumerate() {
+            let key_input = text_input("KEY", key)
+                .on_input(move |v| Message::GlobalEnvKeyChanged(idx, v))
+                .padding(6)
+                .width(Length::FillPortion(2));
+            let value_input = text_input("VALUE", value)
+                .on_input(move |v| Message::GlobalEnvValueChanged(idx, v))
+                .padding(6)
+                .width(Length::FillPortion(3));
+            let remove_btn = button("x")
+                .padding([4, 8])
+                .on_press(Message::RemoveGlobalEnvVar(idx));
+            global_env_col =
+                global_env_col.push(row![key_input, value_input, remove_btn].spacing(4));
+        }
+        let add_global_env_btn = button("+ Add Variable")
+            .padding([4, 12])
+            .on_press(Message::AddGlobalEnvVar);
+        let bnet_use_global_env_checkbox = checkbox(self.config.bnet_use_global_env)
+            .label("Use global environment variables and Proton toggles")
+            .on_toggle(Message::BnetUseGlobalEnvToggled);
+        let mut global_proton_toggles = row![].spacing(24);
+        for flag in ProtonFlag::ALL {
+            global_proton_toggles = global_proton_toggles.push(
+                checkbox(self.config.global_proton.get(flag))
+                    .label(flag.label())
+                    .size(22)
+                    .text_size(18)
+                    .on_toggle(move |enabled| Message::GlobalProtonToggled(flag, enabled)),
+            );
+        }
+        let global_proton_col = column![
+            text("Proton toggles (ignored when using Wine):").size(14),
+            global_proton_toggles
+        ]
+        .spacing(6);
 
         let clients_header = section_header(SettingsSection::Clients);
         let mut clients_column = column![].spacing(12);
@@ -1961,6 +2132,16 @@ impl App {
             let prefix = row![prefix, browse_button(PathTarget::ClientPrefix(idx))]
                 .spacing(4)
                 .align_y(iced::Alignment::Center);
+            let background = row![
+                text_input("Default background", &path_text(client.background.as_ref()))
+                    .on_input(move |value| Message::GameClientBackgroundChanged(idx, value))
+                    .padding(8)
+                    .width(Length::Fill),
+                browse_button(PathTarget::ClientBackground(idx)),
+            ]
+            .spacing(4)
+            .align_y(iced::Alignment::Center);
+
             let selected_override = client.runner.as_ref().and_then(|configured| {
                 self.detected_runners.iter().find(|runner| {
                     same_path(&runner.path, &configured.binary)
@@ -1985,6 +2166,24 @@ impl App {
             let args = text_input("Additional launch arguments", &args)
                 .on_input(move |value| Message::GameClientArgsChanged(idx, value))
                 .padding(8);
+            let mut proton_column =
+                column![text("Proton toggles (ignored when using Wine):").size(14)].spacing(4);
+            for flag in ProtonFlag::ALL {
+                proton_column = proton_column.push(
+                    row![
+                        text(flag.label()).size(12).width(Length::FillPortion(2)),
+                        pick_list(
+                            ProtonChoice::ALL,
+                            Some(ProtonChoice::from(client.proton.get(flag))),
+                            move |choice| Message::GameClientProtonChanged(idx, flag, choice),
+                        )
+                        .padding(6)
+                        .width(Length::FillPortion(3)),
+                    ]
+                    .spacing(4)
+                    .align_y(iced::Alignment::Center),
+                );
+            }
             let mut env_column = column![text("Environment Variables:").size(14)].spacing(4);
             for (env_idx, (key, value)) in client.env_vars.iter().enumerate() {
                 let key_input = text_input("KEY", key)
@@ -2013,13 +2212,17 @@ impl App {
                         executable,
                         text("Prefix (blank uses the client default):").size(14),
                         prefix,
+                        text("Background image (blank uses the default):").size(14),
+                        background,
                         text("Runner override:").size(14),
                         row![runner_picker, runner_reset].spacing(8),
                         args,
+                        proton_column,
                         env_column,
                     ]
                     .spacing(6),
                 )
+                .id(client_card_id(idx))
                 .padding(12)
                 .width(Length::Fill)
                 .style(container::bordered_box),
@@ -2030,7 +2233,7 @@ impl App {
             .on_press(Message::AddGameClient);
         let rescan_clients = button("Rescan install")
             .padding([6, 12])
-            .style(button::secondary)
+            .style(theme::surface_button)
             .on_press(Message::RescanFlavors);
         let mut detected_clients = column![].spacing(6);
         let missing = flavors::unconfigured(&self.detected_flavors, &self.config.game_clients);
@@ -2186,7 +2389,7 @@ impl App {
                 nav.push(
                     button(text(section.title()).size(13))
                         .padding([4, 12])
-                        .style(button::secondary)
+                        .style(theme::surface_button)
                         .on_press(Message::JumpToSection(section)),
                 )
             },
@@ -2206,7 +2409,17 @@ impl App {
             on_launch_label,
             on_launch_picker,
             space().height(8),
+            background_label,
+            background_field,
+            space().height(8),
             check_versions_checkbox,
+            official_artwork_checkbox,
+            space().height(8),
+            global_proton_col,
+            space().height(8),
+            global_env_label,
+            global_env_col,
+            add_global_env_btn,
             space().height(16),
             clients_header,
             clients_column,
@@ -2247,6 +2460,7 @@ impl App {
             .push(bnet_scale_picker)
             .push(bnet_args_label)
             .push(bnet_args_field)
+            .push(bnet_use_global_env_checkbox)
             .push(bnet_env_label)
             .push(bnet_env_col)
             .push(add_bnet_env_btn)
@@ -2449,6 +2663,18 @@ fn reveal_focused() -> Task<Message> {
         .map(Message::SectionScrollTarget)
 }
 
+/// Scroll the settings page so the target's top edge is at the top of the view.
+fn scroll_to_target(target: SettingsTarget) -> Task<Message> {
+    use iced::widget::selector;
+    selector::find(selector::id(target.id()))
+        .then(|target| match target {
+            Some(target) => selector::find(selector::id(SETTINGS_CONTENT_ID))
+                .map(move |top| top.map(|top| target.bounds().y - top.bounds().y)),
+            None => Task::done(None),
+        })
+        .map(Message::SectionScrollTarget)
+}
+
 fn section_header<'a>(section: SettingsSection) -> Element<'a, Message> {
     let bold = Font {
         weight: iced::font::Weight::Bold,
@@ -2465,6 +2691,15 @@ fn section_header<'a>(section: SettingsSection) -> Element<'a, Message> {
     .id(section.id())
     .width(Length::Fill)
     .into()
+}
+
+fn optional_path(input: &str) -> Option<std::path::PathBuf> {
+    let input = input.trim();
+    (!input.is_empty()).then(|| std::path::PathBuf::from(input))
+}
+
+fn path_text(path: Option<&std::path::PathBuf>) -> String {
+    path.map_or_else(String::new, |path| path.to_string_lossy().into_owned())
 }
 
 fn browse_button<'a>(target: PathTarget) -> Element<'a, Message> {
@@ -2508,6 +2743,22 @@ fn effective_runner_label(
     } else {
         "No Proton runner — download Proton-GE in Settings".into()
     }
+}
+
+/// Move the client `id` to the position of `target`. Returns whether anything moved.
+fn move_client(clients: &mut Vec<GameClient>, id: &str, target: &str) -> bool {
+    let (Some(from), Some(to)) = (
+        clients.iter().position(|client| client.id == id),
+        clients.iter().position(|client| client.id == target),
+    ) else {
+        return false;
+    };
+    if from == to {
+        return false;
+    }
+    let client = clients.remove(from);
+    clients.insert(to, client);
+    true
 }
 
 fn next_client_id(clients: &[GameClient]) -> String {
@@ -2602,6 +2853,79 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+
+    #[test]
+    fn opening_settings_from_the_main_screen_switches_screens_and_keeps_the_target() {
+        let (mut app, startup) = App::new();
+        drop(startup);
+        app.loaded = true;
+
+        let _ = app.update(Message::OpenSettings(SettingsTarget::Client(1)));
+
+        assert!(matches!(app.screen, Screen::Settings));
+        assert!(app.settings_snapshot.is_some());
+        assert_eq!(SettingsTarget::Client(1).id(), "settings-client-1");
+        assert_eq!(
+            SettingsTarget::Section(SettingsSection::Clients).id(),
+            "settings-section-clients"
+        );
+    }
+
+    fn client(id: &str) -> GameClient {
+        GameClient {
+            id: id.into(),
+            name: id.into(),
+            ..GameClient::default()
+        }
+    }
+
+    fn ids(clients: &[GameClient]) -> Vec<&str> {
+        clients.iter().map(|client| client.id.as_str()).collect()
+    }
+
+    #[test]
+    fn moving_a_client_takes_the_position_of_the_target() {
+        let mut clients = vec![client("a"), client("b"), client("c"), client("d")];
+
+        assert!(move_client(&mut clients, "a", "c"));
+        assert_eq!(ids(&clients), ["b", "c", "a", "d"]);
+        assert!(move_client(&mut clients, "d", "b"));
+        assert_eq!(ids(&clients), ["d", "b", "c", "a"]);
+        assert!(!move_client(&mut clients, "b", "b"));
+        assert!(!move_client(&mut clients, "b", "missing"));
+        assert!(!move_client(&mut clients, "missing", "b"));
+        assert_eq!(ids(&clients), ["d", "b", "c", "a"]);
+    }
+
+    #[test]
+    fn dragging_a_tab_reorders_selects_and_ends_on_release() {
+        let (mut app, startup) = App::new();
+        drop(startup);
+        app.loaded = true;
+        app.config.game_clients = vec![client("a"), client("b"), client("c")];
+        app.config.selected_game_client = "a".into();
+
+        let _ = app.update(Message::ClientTabPressed("c".into()));
+        assert_eq!(app.config.selected_game_client, "c");
+        assert!(app.tab_drag.is_some());
+
+        let _ = app.update(Message::ClientTabEntered("a".into()));
+        assert_eq!(ids(&app.config.game_clients), ["c", "a", "b"]);
+
+        let _ = app.update(Message::ClientTabReleased);
+        assert!(app.tab_drag.is_none());
+        let _ = app.update(Message::ClientTabEntered("b".into()));
+        assert_eq!(ids(&app.config.game_clients), ["c", "a", "b"]);
+    }
+
+    #[test]
+    fn blank_image_paths_clear_the_background() {
+        assert_eq!(optional_path("  "), None);
+        assert_eq!(
+            optional_path(" /art/a.jpg "),
+            Some(PathBuf::from("/art/a.jpg"))
+        );
+    }
 
     #[test]
     fn startup_and_pending_operations_do_not_block_navigation() {

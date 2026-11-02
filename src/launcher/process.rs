@@ -122,7 +122,7 @@ fn build_game_command(
     if config.runner.dxvk && runner.runner_type == RunnerType::Wine {
         cmd.env("WINEDLLOVERRIDES", "d3d11,dxgi=n,b");
     }
-    for (key, value) in &client.env_vars {
+    for (key, value) in config.client_env_vars(client, runner.runner_type) {
         cmd.env(key, value);
     }
     if config.mangohud_enabled {

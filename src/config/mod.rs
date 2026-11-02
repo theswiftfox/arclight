@@ -25,6 +25,14 @@ pub struct Config {
     pub auto_update: bool,
     /// Ask Blizzard's version service whether installed clients are out of date
     pub check_versions: bool,
+    /// Show official artwork from the public `WoW` game pages when no image is set
+    pub official_artwork: bool,
+    /// Default background image for the main screen (clients can override it)
+    pub background_image: Option<PathBuf>,
+    /// Environment variables applied to every game client (clients can override them)
+    pub global_env_vars: Vec<(String, String)>,
+    /// Proton toggles applied to every client (clients can override them)
+    pub global_proton: ProtonToggles,
 
     // WoW launch settings
     /// Additional launch arguments for `WoW`
@@ -42,6 +50,8 @@ pub struct Config {
     pub bnet_args: Vec<String>,
     /// Environment variables for Battle.net
     pub bnet_env_vars: Vec<(String, String)>,
+    /// Apply the global environment variables to Battle.net (its own variables override them)
+    pub bnet_use_global_env: bool,
     /// Battle.net UI scaling in percent (100 = no scaling), applied as Wine DPI
     pub bnet_scale_percent: u32,
 
@@ -119,8 +129,12 @@ pub struct GameClient {
     pub args: Vec<String>,
     /// Environment variables applied when launching this client
     pub env_vars: Vec<(String, String)>,
+    /// Proton toggle overrides; unset values use the global setting
+    pub proton: ProtonOverrides,
     /// Skip Battle.net launcher-login arguments when they are available
     pub skip_default_args: bool,
+    /// Background image for this client; `None` uses the global default
+    pub background: Option<PathBuf>,
 }
 
 impl GameClient {
@@ -162,7 +176,9 @@ impl Default for GameClient {
             prefix: None,
             args: Vec::new(),
             env_vars: Vec::new(),
+            proton: ProtonOverrides::default(),
             skip_default_args: false,
+            background: None,
         }
     }
 }
@@ -239,11 +255,16 @@ impl Default for Config {
             on_launch: OnLaunchBehavior::Minimize,
             auto_update: true,
             check_versions: true,
+            official_artwork: true,
+            background_image: None,
+            global_env_vars: Vec::new(),
+            global_proton: ProtonToggles::default(),
             wow_args: Vec::new(),
             wow_env_vars: Vec::new(),
             wow_skip_default_args: false,
             bnet_args: vec!["--in-process-gpu".to_string()],
             bnet_env_vars: Vec::new(),
+            bnet_use_global_env: true,
             bnet_scale_percent: 100,
             drive_mappings: Vec::new(),
             mangohud_enabled: false,
@@ -274,7 +295,154 @@ impl Default for RunnerConfig {
 /// Scaling choices offered for the Battle.net client.
 pub const BNET_SCALE_OPTIONS: [u32; 5] = [100, 125, 150, 175, 200];
 
+/// Merge environment variable lists; later lists override earlier ones by key.
+/// Each key appears once, in order of first appearance.
+#[must_use]
+pub fn merge_env_vars(layers: &[&[(String, String)]]) -> Vec<(String, String)> {
+    let mut merged: Vec<(String, String)> = Vec::new();
+    for (key, value) in layers.iter().copied().flatten() {
+        if key.is_empty() {
+            continue;
+        }
+        if let Some(entry) = merged.iter_mut().find(|(existing, _)| existing == key) {
+            entry.1.clone_from(value);
+        } else {
+            merged.push((key.clone(), value.clone()));
+        }
+    }
+    merged
+}
+
+/// Common Proton switches exposed as toggles instead of raw environment variables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtonFlag {
+    Wayland,
+    Hdr,
+    Ntsync,
+}
+
+impl ProtonFlag {
+    pub const ALL: [Self; 3] = [Self::Wayland, Self::Hdr, Self::Ntsync];
+
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Wayland => "Use Wayland",
+            Self::Hdr => "Use HDR",
+            Self::Ntsync => "Use NTSync",
+        }
+    }
+
+    #[must_use]
+    pub fn env_var(self) -> &'static str {
+        match self {
+            Self::Wayland => "PROTON_ENABLE_WAYLAND",
+            Self::Hdr => "PROTON_ENABLE_HDR",
+            Self::Ntsync => "PROTON_USE_NTSYNC",
+        }
+    }
+}
+
+/// Global on/off state of the Proton toggles.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProtonToggles {
+    pub wayland: bool,
+    pub hdr: bool,
+    pub ntsync: bool,
+}
+
+impl ProtonToggles {
+    #[must_use]
+    pub fn get(&self, flag: ProtonFlag) -> bool {
+        match flag {
+            ProtonFlag::Wayland => self.wayland,
+            ProtonFlag::Hdr => self.hdr,
+            ProtonFlag::Ntsync => self.ntsync,
+        }
+    }
+
+    pub fn set(&mut self, flag: ProtonFlag, value: bool) {
+        match flag {
+            ProtonFlag::Wayland => self.wayland = value,
+            ProtonFlag::Hdr => self.hdr = value,
+            ProtonFlag::Ntsync => self.ntsync = value,
+        }
+    }
+}
+
+/// Per-client Proton toggles; `None` inherits the global value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProtonOverrides {
+    pub wayland: Option<bool>,
+    pub hdr: Option<bool>,
+    pub ntsync: Option<bool>,
+}
+
+impl ProtonOverrides {
+    #[must_use]
+    pub fn get(&self, flag: ProtonFlag) -> Option<bool> {
+        match flag {
+            ProtonFlag::Wayland => self.wayland,
+            ProtonFlag::Hdr => self.hdr,
+            ProtonFlag::Ntsync => self.ntsync,
+        }
+    }
+
+    pub fn set(&mut self, flag: ProtonFlag, value: Option<bool>) {
+        match flag {
+            ProtonFlag::Wayland => self.wayland = value,
+            ProtonFlag::Hdr => self.hdr = value,
+            ProtonFlag::Ntsync => self.ntsync = value,
+        }
+    }
+}
+
+/// Environment variables for the enabled toggles; empty unless running under Proton.
+fn proton_toggle_env(
+    runner_type: RunnerType,
+    enabled: impl Fn(ProtonFlag) -> bool,
+) -> Vec<(String, String)> {
+    if runner_type != RunnerType::Proton {
+        return Vec::new();
+    }
+    ProtonFlag::ALL
+        .into_iter()
+        .filter(|&flag| enabled(flag))
+        .map(|flag| (flag.env_var().to_owned(), "1".to_owned()))
+        .collect()
+}
+
 impl Config {
+    /// Environment variables for a game client: Proton toggles, then global variables,
+    /// then the client's own variables (later entries override earlier ones).
+    #[must_use]
+    pub fn client_env_vars(
+        &self,
+        client: &GameClient,
+        runner_type: RunnerType,
+    ) -> Vec<(String, String)> {
+        let toggles = proton_toggle_env(runner_type, |flag| {
+            client
+                .proton
+                .get(flag)
+                .unwrap_or_else(|| self.global_proton.get(flag))
+        });
+        merge_env_vars(&[&toggles, &self.global_env_vars, &client.env_vars])
+    }
+
+    /// Environment variables for Battle.net, including the global ones when enabled.
+    #[must_use]
+    pub fn bnet_effective_env_vars(&self, runner_type: RunnerType) -> Vec<(String, String)> {
+        if self.bnet_use_global_env {
+            let toggles = proton_toggle_env(runner_type, |flag| self.global_proton.get(flag));
+            merge_env_vars(&[&toggles, &self.global_env_vars, &self.bnet_env_vars])
+        } else {
+            merge_env_vars(&[&self.bnet_env_vars])
+        }
+    }
+
     /// Wine `LogPixels` value for the configured Battle.net scale (96 DPI = 100%).
     #[must_use]
     pub fn bnet_dpi(&self) -> u32 {
@@ -351,6 +519,15 @@ impl Config {
             .wow_prefix
             .clone()
             .unwrap_or_else(AppPaths::default_wow_prefix)
+    }
+
+    /// The background image to show for a client: its own, else the global default.
+    #[must_use]
+    pub fn background_for<'a>(&'a self, client: &'a GameClient) -> Option<&'a Path> {
+        client
+            .background
+            .as_deref()
+            .or(self.background_image.as_deref())
     }
 
     #[must_use]
@@ -464,6 +641,76 @@ mod tests {
     use super::*;
 
     #[test]
+    fn client_env_overrides_global_without_duplicates() {
+        let config = Config {
+            global_env_vars: vec![("A".into(), "1".into()), ("B".into(), "2".into())],
+            ..Config::default()
+        };
+        let mut client = GameClient::retail();
+        client.env_vars = vec![("B".into(), "3".into()), ("C".into(), "4".into())];
+        assert_eq!(
+            config.client_env_vars(&client, RunnerType::Wine),
+            [
+                ("A".into(), "1".into()),
+                ("B".into(), "3".into()),
+                ("C".into(), "4".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn bnet_global_env_is_optional() {
+        let mut config = Config {
+            global_env_vars: vec![("A".into(), "1".into())],
+            bnet_env_vars: vec![("A".into(), "2".into())],
+            ..Config::default()
+        };
+        assert_eq!(
+            config.bnet_effective_env_vars(RunnerType::Wine),
+            [("A".into(), "2".into())]
+        );
+        config.bnet_env_vars.clear();
+        assert_eq!(
+            config.bnet_effective_env_vars(RunnerType::Wine),
+            [("A".into(), "1".into())]
+        );
+        config.bnet_use_global_env = false;
+        assert!(config.bnet_effective_env_vars(RunnerType::Wine).is_empty());
+    }
+
+    #[test]
+    fn proton_toggles_inherit_override_and_skip_wine() {
+        let mut config = Config::default();
+        config.global_proton.wayland = true;
+        config.global_proton.hdr = true;
+        let mut client = GameClient::retail();
+        client.proton.hdr = Some(false);
+        client.proton.ntsync = Some(true);
+        let env = config.client_env_vars(&client, RunnerType::Proton);
+        assert_eq!(
+            env,
+            [
+                ("PROTON_ENABLE_WAYLAND".into(), "1".into()),
+                ("PROTON_USE_NTSYNC".into(), "1".into())
+            ]
+        );
+        assert!(config.client_env_vars(&client, RunnerType::Wine).is_empty());
+        client.env_vars = vec![("PROTON_ENABLE_WAYLAND".into(), "0".into())];
+        assert_eq!(
+            config.client_env_vars(&client, RunnerType::Proton)[0],
+            ("PROTON_ENABLE_WAYLAND".into(), "0".into())
+        );
+        config.bnet_use_global_env = true;
+        assert_eq!(config.bnet_effective_env_vars(RunnerType::Proton).len(), 2);
+        config.bnet_use_global_env = false;
+        assert!(
+            config
+                .bnet_effective_env_vars(RunnerType::Proton)
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn bnet_dpi_follows_scale() {
         let mut config = Config::default();
         assert_eq!(config.bnet_dpi(), 96);
@@ -480,6 +727,33 @@ mod tests {
         assert_eq!(config.selected_game_client, "retail");
         assert_eq!(config.game_clients[0], GameClient::retail());
         assert_eq!(config.game_clients[1], GameClient::classic());
+    }
+
+    #[test]
+    fn client_background_overrides_the_default() {
+        let mut config = Config::default();
+        let mut client = GameClient::retail();
+        assert_eq!(config.background_for(&client), None);
+
+        config.background_image = Some("/art/default.jpg".into());
+        assert_eq!(
+            config.background_for(&client),
+            Some(Path::new("/art/default.jpg"))
+        );
+
+        client.background = Some("/art/retail.png".into());
+        assert_eq!(
+            config.background_for(&client),
+            Some(Path::new("/art/retail.png"))
+        );
+    }
+
+    #[test]
+    fn old_configs_without_backgrounds_still_load() {
+        let config = Config::from_toml("game_path = \"/games/wow\"\n").unwrap();
+
+        assert_eq!(config.background_image, None);
+        assert!(config.game_clients.iter().all(|c| c.background.is_none()));
     }
 
     #[test]

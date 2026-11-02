@@ -1,3 +1,4 @@
+pub mod artwork;
 pub mod bnet;
 pub mod detect;
 pub mod flavors;

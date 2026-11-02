@@ -53,6 +53,20 @@ impl AppPaths {
         }
     }
 
+    /// Cache directory: ~/.cache/arclight/
+    #[must_use]
+    pub fn cache_dir() -> PathBuf {
+        dirs::cache_dir()
+            .unwrap_or_else(|| PathBuf::from("~/.cache"))
+            .join("arclight")
+    }
+
+    /// Official artwork downloaded from the game pages
+    #[must_use]
+    pub fn art_dir() -> PathBuf {
+        Self::cache_dir().join("art")
+    }
+
     /// Log directory
     #[must_use]
     pub fn log_dir() -> PathBuf {

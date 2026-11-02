@@ -14,6 +14,10 @@ Arclight manages Wine/Proton runners, Battle.net installation, and game launchin
   product to Blizzard's public version service (`<region>.version.battle.net`), cached for 30
   minutes and switchable off in Settings. Arclight never downloads or patches game files.
 - Detect installed flavors (PTR, Beta, Classic Era, ...) in the install folder and offer to add them as clients
+- Background image for the main screen: your own (globally or per client), or official artwork. Official
+  artwork is read from the public WoW game pages (`worldofwarcraft.blizzard.com`), checked about
+  weekly, and cached in `~/.cache/arclight/art`. Blizzard's images are never bundled or
+  redistributed, and the Settings checkbox turns this off.
 - Configure per-client executables, Wine/Proton runners, prefixes, arguments, and environment variables
 
 ## Building

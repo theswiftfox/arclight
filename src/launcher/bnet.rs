@@ -1,4 +1,7 @@
-use std::{path::Path, process::Stdio};
+use std::{
+    path::{Path, PathBuf},
+    process::Stdio,
+};
 
 use tokio::process::Command;
 
@@ -23,6 +26,46 @@ pub enum AuthStatus {
     BnetLoggedIn,
     /// Full `WoW` session token in registry — auto-login will work
     WowReady { game_account: String },
+}
+
+/// The installed Battle.net's own icon, as extracted by Proton into the prefix.
+///
+/// Picks the largest size available. Returns `None` when Battle.net has not
+/// been installed through a prefix that extracts icons.
+#[must_use]
+pub fn find_icon(config: &Config) -> Option<PathBuf> {
+    icon_in_prefix(&config.wine_prefix_root())
+}
+
+fn icon_in_prefix(prefix_root: &Path) -> Option<PathBuf> {
+    let icons = prefix_root.join("drive_c/proton_shortcuts/icons");
+    std::fs::read_dir(icons)
+        .ok()?
+        .flatten()
+        .filter_map(|size_dir| {
+            let size: u32 = size_dir
+                .file_name()
+                .to_str()?
+                .split('x')
+                .next()?
+                .parse()
+                .ok()?;
+            let icon = std::fs::read_dir(size_dir.path().join("apps"))
+                .ok()?
+                .flatten()
+                .map(|entry| entry.path())
+                .find(|path| {
+                    path.extension().is_some_and(|extension| extension == "png")
+                        && path.file_name().is_some_and(|name| {
+                            name.to_string_lossy()
+                                .to_ascii_lowercase()
+                                .contains("battle.net launcher")
+                        })
+                })?;
+            Some((size, icon))
+        })
+        .max_by_key(|(size, _)| *size)
+        .map(|(_, icon)| icon)
 }
 
 /// Check auth status by parsing the Wine registry
@@ -290,8 +333,7 @@ pub async fn launch_bnet(config: &Config, log_sender: Option<LogSender>) -> anyh
                 cmd.arg(arg);
             }
 
-            // Add Battle.net specific env vars
-            for (key, value) in &config.bnet_env_vars {
+            for (key, value) in config.bnet_effective_env_vars(runner.runner_type) {
                 cmd.env(key, value);
             }
             Ok(cmd)
@@ -392,6 +434,28 @@ fn build_wine_command(runner: &Runner, prefix: &Path, exe: &Path, config: &Confi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn icon_lookup_picks_the_largest_battlenet_launcher_icon() {
+        let root = std::env::temp_dir().join(format!("arclight-bnet-icon-{}", std::process::id()));
+        let icons = root.join("drive_c/proton_shortcuts/icons");
+        for (size, name) in [
+            ("16x16", "1AC2_Battle.net Launcher.0.png"),
+            ("128x128", "1AC2_Battle.net Launcher.0.png"),
+            ("256x256", "5DE2_World of Warcraft Launcher.0.png"),
+            ("64x64", "1AC2_Battle.net Launcher.0.svg"),
+        ] {
+            let apps = icons.join(size).join("apps");
+            std::fs::create_dir_all(&apps).unwrap();
+            std::fs::write(apps.join(name), b"x").unwrap();
+        }
+
+        let icon = icon_in_prefix(&root).unwrap();
+
+        assert!(icon.starts_with(icons.join("128x128")));
+        assert_eq!(icon_in_prefix(&root.join("missing")), None);
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn test_parse_auth_logged_in_wow() {
