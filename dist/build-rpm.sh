@@ -5,7 +5,7 @@ NAME="arclight"
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
 RELEASE="${RELEASE:-1}"
 CHANGELOG_MSG="${1:-$(git log -1 --format=%s)}"
-TOPDIR="$(pwd)/rpmbuild"
+TOPDIR="${TOPDIR:-$(pwd)/rpmbuild}"
 
 echo "> Cleaning previous build..."
 rm -rf "$TOPDIR"
@@ -14,7 +14,7 @@ mkdir -p "$TOPDIR"/{SOURCES,SPECS,BUILD,RPMS,SRPMS}
 echo "> Creating source tarball..."
 tar czf "$TOPDIR/SOURCES/${NAME}-${VERSION}.tar.gz" \
     --transform="s,^,${NAME}-${VERSION}/," \
-    --exclude=target --exclude=rpmbuild --exclude=.git \
+    --exclude=target --exclude=./rpmbuild --exclude=.git \
     -C "$(pwd)" .
 
 echo "> Writing spec file..."

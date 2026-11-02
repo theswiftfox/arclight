@@ -27,6 +27,10 @@ pub struct Config {
     pub check_versions: bool,
     /// Show official artwork from the public `WoW` game pages when no image is set
     pub official_artwork: bool,
+    /// Show thumbnails next to the headlines in the news overlay
+    pub news_thumbnails: bool,
+    /// Site language and region of the news overlay
+    pub news_locale: NewsLocale,
     /// Default background image for the main screen (clients can override it)
     pub background_image: Option<PathBuf>,
     /// Environment variables applied to every game client (clients can override them)
@@ -203,6 +207,119 @@ pub enum Region {
     TW,
 }
 
+/// Language and region versions of the `WoW` website.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NewsLocale {
+    #[serde(rename = "en-gb")]
+    EnGb,
+    #[serde(rename = "en-us")]
+    EnUs,
+    #[serde(rename = "de-de")]
+    DeDe,
+    #[serde(rename = "fr-fr")]
+    FrFr,
+    #[serde(rename = "es-es")]
+    EsEs,
+    #[serde(rename = "es-mx")]
+    EsMx,
+    #[serde(rename = "it-it")]
+    ItIt,
+    #[serde(rename = "pt-br")]
+    PtBr,
+    #[serde(rename = "pl-pl")]
+    PlPl,
+    #[serde(rename = "ru-ru")]
+    RuRu,
+    #[serde(rename = "ko-kr")]
+    KoKr,
+    #[serde(rename = "zh-tw")]
+    ZhTw,
+}
+
+impl NewsLocale {
+    pub const ALL: [Self; 12] = [
+        Self::EnGb,
+        Self::EnUs,
+        Self::DeDe,
+        Self::FrFr,
+        Self::EsEs,
+        Self::EsMx,
+        Self::ItIt,
+        Self::PtBr,
+        Self::PlPl,
+        Self::RuRu,
+        Self::KoKr,
+        Self::ZhTw,
+    ];
+
+    /// Path segment used by the website.
+    #[must_use]
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::EnGb => "en-gb",
+            Self::EnUs => "en-us",
+            Self::DeDe => "de-de",
+            Self::FrFr => "fr-fr",
+            Self::EsEs => "es-es",
+            Self::EsMx => "es-mx",
+            Self::ItIt => "it-it",
+            Self::PtBr => "pt-br",
+            Self::PlPl => "pl-pl",
+            Self::RuRu => "ru-ru",
+            Self::KoKr => "ko-kr",
+            Self::ZhTw => "zh-tw",
+        }
+    }
+
+    /// Best match for the system language such as `de_DE.UTF-8`, else British English.
+    #[must_use]
+    pub fn from_environment() -> Self {
+        let value = ["LC_ALL", "LC_MESSAGES", "LANG"]
+            .iter()
+            .find_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()))
+            .unwrap_or_default();
+        Self::from_system_locale(&value)
+    }
+
+    pub(crate) fn from_system_locale(value: &str) -> Self {
+        let name = value
+            .split(['.', '@'])
+            .next()
+            .unwrap_or_default()
+            .replace('_', "-")
+            .to_ascii_lowercase();
+        Self::ALL
+            .into_iter()
+            .find(|locale| locale.code() == name)
+            .or_else(|| {
+                let language = name.split('-').next().unwrap_or_default();
+                Self::ALL
+                    .into_iter()
+                    .find(|locale| locale.code().split('-').next() == Some(language))
+            })
+            .unwrap_or(Self::EnGb)
+    }
+}
+
+impl std::fmt::Display for NewsLocale {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::EnGb => "English (Europe)",
+            Self::EnUs => "English (Americas)",
+            Self::DeDe => "Deutsch",
+            Self::FrFr => "Français",
+            Self::EsEs => "Español (EU)",
+            Self::EsMx => "Español (AL)",
+            Self::ItIt => "Italiano",
+            Self::PtBr => "Português",
+            Self::PlPl => "Polski",
+            Self::RuRu => "Русский",
+            Self::KoKr => "한국어",
+            Self::ZhTw => "繁體中文",
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OnLaunchBehavior {
     DoNothing,
@@ -256,6 +373,8 @@ impl Default for Config {
             auto_update: true,
             check_versions: true,
             official_artwork: true,
+            news_thumbnails: true,
+            news_locale: NewsLocale::from_environment(),
             background_image: None,
             global_env_vars: Vec::new(),
             global_proton: ProtonToggles::default(),

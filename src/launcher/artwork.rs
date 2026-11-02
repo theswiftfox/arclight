@@ -118,7 +118,7 @@ fn extension(url: &str) -> &'static str {
     }
 }
 
-fn fnv(text: &str) -> u64 {
+pub(super) fn fnv(text: &str) -> u64 {
     text.bytes().fold(0xCBF2_9CE4_8422_2325, |hash, byte| {
         (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01B3)
     })

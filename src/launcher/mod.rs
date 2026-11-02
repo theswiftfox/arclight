@@ -2,6 +2,7 @@ pub mod artwork;
 pub mod bnet;
 pub mod detect;
 pub mod flavors;
+pub mod news;
 pub mod process;
 pub mod proton_ge;
 pub mod steam;

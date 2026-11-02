@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use iced::{
@@ -15,8 +15,8 @@ use iced::{
 use crate::{
     background::{self, DISCOVERY_TIMEOUT, IO_TIMEOUT},
     config::{
-        BNET_SCALE_OPTIONS, Config, GameClient, OnLaunchBehavior, ProtonFlag, RunnerOverride,
-        RunnerType,
+        BNET_SCALE_OPTIONS, Config, GameClient, NewsLocale, OnLaunchBehavior, ProtonFlag,
+        RunnerOverride, RunnerType,
     },
     launcher,
     launcher::{
@@ -24,6 +24,7 @@ use crate::{
         bnet::{self, AuthStatus},
         detect::DetectedRunner,
         flavors::{self, DetectedFlavor},
+        news::{self, NewsItem},
         version::{self, ClientVersion, Latest, LatestKey},
     },
 };
@@ -268,6 +269,12 @@ pub enum Message {
     RescanFlavors,
     CheckVersionsToggled(bool),
     OfficialArtworkToggled(bool),
+    NewsThumbnailsToggled(bool),
+    ToggleNews,
+    RetryNews,
+    NewsLocaleChanged(NewsLocale),
+    NewsLoaded(u64, Result<Vec<NewsItem>, String>),
+    OpenUrl(String),
     BnetRunnerSelected(DetectedRunner),
     BnetRunnerReset,
     OnLaunchChanged(OnLaunchBehavior),
@@ -390,7 +397,22 @@ pub struct App {
     hovered_tab: Option<String>,
     art_generation: u64,
     art_applied: u64,
+    news_open: bool,
+    news: NewsState,
+    news_generation: u64,
 }
+
+#[derive(Debug, Clone, Default)]
+enum NewsState {
+    #[default]
+    Idle,
+    Loading,
+    Loaded(Vec<NewsItem>, Instant),
+    Failed(String),
+}
+
+/// News older than this is fetched again when the overlay is opened.
+const NEWS_MAX_AGE: Duration = Duration::from_mins(15);
 
 impl App {
     pub fn new() -> (Self, Task<Message>) {
@@ -467,6 +489,9 @@ impl App {
             hovered_tab: None,
             art_generation: 0,
             art_applied: 0,
+            news_open: false,
+            news: NewsState::Idle,
+            news_generation: 0,
         };
 
         // The stream owns its receiver for the app lifetime; UI callbacks never lock it.
@@ -517,6 +542,22 @@ impl App {
                     .map_err(|error| format!("{error:#}"))
             },
             move |result| Message::VersionsChecked(generation, result),
+        )
+    }
+
+    fn news_task(&mut self) -> Task<Message> {
+        self.news_generation += 1;
+        let generation = self.news_generation;
+        self.news = NewsState::Loading;
+        let thumbnails = self.config.news_thumbnails;
+        let locale = self.config.news_locale;
+        Task::perform(
+            async move {
+                news::fetch(locale, thumbnails)
+                    .await
+                    .map_err(|error| format!("{error:#}"))
+            },
+            move |result| Message::NewsLoaded(generation, result),
         )
     }
 
@@ -1649,6 +1690,57 @@ impl App {
             Message::RescanFlavors => return self.rescan_flavors_task(),
             Message::CheckVersionsToggled(enabled) => self.config.check_versions = enabled,
             Message::OfficialArtworkToggled(enabled) => self.config.official_artwork = enabled,
+            Message::NewsThumbnailsToggled(enabled) => {
+                self.config.news_thumbnails = enabled;
+                self.news = NewsState::Idle;
+                self.news_open = false;
+            }
+            Message::NewsLocaleChanged(locale) => {
+                self.config.news_locale = locale;
+                self.news = NewsState::Idle;
+                self.news_open = false;
+            }
+            Message::RetryNews => return self.news_task(),
+            Message::ToggleNews => {
+                self.news_open = !self.news_open;
+                let stale = match &self.news {
+                    NewsState::Idle | NewsState::Failed(_) => true,
+                    NewsState::Loading => false,
+                    NewsState::Loaded(_, fetched_at) => fetched_at.elapsed() >= NEWS_MAX_AGE,
+                };
+                if self.news_open && stale {
+                    return self.news_task();
+                }
+            }
+            Message::NewsLoaded(generation, result) if generation == self.news_generation => {
+                self.news = match result {
+                    Ok(items) => NewsState::Loaded(items, Instant::now()),
+                    Err(error) => {
+                        tracing::warn!("Loading news failed: {error}");
+                        NewsState::Failed(error)
+                    }
+                };
+            }
+            Message::OpenUrl(url) => {
+                if !url.starts_with(news::SITE) {
+                    return Task::none();
+                }
+                return Task::future(async move {
+                    let spawned = tokio::process::Command::new("xdg-open")
+                        .arg(&url)
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn();
+                    match spawned {
+                        Ok(mut child) => {
+                            let _ = child.wait().await;
+                        }
+                        Err(error) => tracing::warn!("Could not open {url}: {error}"),
+                    }
+                })
+                .discard();
+            }
             Message::RemoveGameClient(idx) => {
                 if idx < self.config.game_clients.len() {
                     self.config.game_clients.remove(idx);
@@ -2033,6 +2125,15 @@ impl App {
         .padding(8)
         .width(Length::Fill);
 
+        let news_locale_label = text("News language and region:").size(14);
+        let news_locale_picker = pick_list(
+            NewsLocale::ALL,
+            Some(self.config.news_locale),
+            Message::NewsLocaleChanged,
+        )
+        .padding(8)
+        .width(Length::Fill);
+
         let background_label = text("Default background image (optional):").size(14);
         let background_field = row![
             text_input(
@@ -2048,20 +2149,16 @@ impl App {
         .align_y(iced::Alignment::Center);
 
         let check_versions_checkbox = checkbox(self.config.check_versions)
-            .label("Check for newer game versions (asks Blizzard's public version service)")
+            .label("Check for newer game versions")
             .on_toggle(Message::CheckVersionsToggled);
         let official_artwork_checkbox = checkbox(self.config.official_artwork)
-            .label(
-                "Show official artwork from the WoW game pages (about one image per client, \
-                 checked weekly)",
-            )
+            .label("Show official artwork from the WoW game pages")
             .on_toggle(Message::OfficialArtworkToggled);
+        let news_thumbnails_checkbox = checkbox(self.config.news_thumbnails)
+            .label("Show thumbnails in the news overlay")
+            .on_toggle(Message::NewsThumbnailsToggled);
 
-        let global_env_label = text(
-            "Global environment variables (applied to all clients; a client's own variables \
-             override them):",
-        )
-        .size(14);
+        let global_env_label = text("Global environment variables:").size(14);
         let mut global_env_col = column![].spacing(4);
         for (idx, (key, value)) in self.config.global_env_vars.iter().enumerate() {
             let key_input = text_input("KEY", key)
@@ -2089,8 +2186,6 @@ impl App {
             global_proton_toggles = global_proton_toggles.push(
                 checkbox(self.config.global_proton.get(flag))
                     .label(flag.label())
-                    .size(22)
-                    .text_size(18)
                     .on_toggle(move |enabled| Message::GlobalProtonToggled(flag, enabled)),
             );
         }
@@ -2409,11 +2504,15 @@ impl App {
             on_launch_label,
             on_launch_picker,
             space().height(8),
+            news_locale_label,
+            news_locale_picker,
+            space().height(8),
             background_label,
             background_field,
             space().height(8),
             check_versions_checkbox,
             official_artwork_checkbox,
+            news_thumbnails_checkbox,
             space().height(8),
             global_proton_col,
             space().height(8),

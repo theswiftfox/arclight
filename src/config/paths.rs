@@ -67,6 +67,12 @@ impl AppPaths {
         Self::cache_dir().join("art")
     }
 
+    /// News thumbnails downloaded from the `WoW` news page
+    #[must_use]
+    pub fn news_dir() -> PathBuf {
+        Self::cache_dir().join("news")
+    }
+
     /// Log directory
     #[must_use]
     pub fn log_dir() -> PathBuf {

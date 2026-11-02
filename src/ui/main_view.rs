@@ -9,9 +9,16 @@ use iced::{
 };
 
 use super::{
-    App, EMOJI_FONT, Message, SettingsSection, SettingsTarget, effective_runner_label, theme,
+    App, EMOJI_FONT, Message, NewsState, SettingsSection, SettingsTarget, effective_runner_label,
+    theme,
 };
-use crate::{config::GameClient, launcher::bnet::AuthStatus};
+use crate::{
+    config::GameClient,
+    launcher::{
+        bnet::AuthStatus,
+        news::{self, NewsItem},
+    },
+};
 
 impl App {
     pub(super) fn view_main(&self) -> Element<'_, Message> {
@@ -249,7 +256,7 @@ impl App {
             }
         });
 
-        match background {
+        let hero: Element<'a, Message> = match background {
             // The hero's height is fractional. Keep the picture off its last pixel row so
             // the anti-aliased overlay never lets a bright sliver of it show above the panel.
             Some(path) => stack![
@@ -269,7 +276,137 @@ impl App {
             .height(Length::Fill)
             .into(),
             None => content.into(),
+        };
+
+        stack![hero, self.view_news_layer()]
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
+    /// The "Show news" button, or the news panel over the right two thirds of the hero.
+    fn view_news_layer(&self) -> Element<'_, Message> {
+        if !self.news_open {
+            return container(
+                button(text("Show news").size(13))
+                    .padding([6, 14])
+                    .style(news_button_style)
+                    .on_press(Message::ToggleNews),
+            )
+            .padding(16)
+            .align_right(Length::Fill)
+            .into();
         }
+
+        let header = row![
+            text("News").size(18).color(theme::COLOR_GOLD),
+            space().width(Length::Fill),
+            button(text("Patch notes").size(13))
+                .padding([5, 12])
+                .style(theme::surface_button)
+                .on_press(Message::OpenUrl(news::patch_notes_url(
+                    self.config.news_locale
+                ))),
+            button(text("Hide news").size(13))
+                .padding([5, 12])
+                .style(theme::surface_button)
+                .on_press(Message::ToggleNews),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+
+        let body: Element<'_, Message> = match &self.news {
+            NewsState::Loaded(items, _) => {
+                let now = chrono::Utc::now();
+                let cards = items.iter().map(|item| self.view_news_card(item, now));
+                scrollable(
+                    column(cards)
+                        .spacing(8)
+                        .padding(iced::Padding::ZERO.right(14)),
+                )
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+            }
+            NewsState::Failed(error) => column![
+                text("The news could not be loaded.").size(14),
+                text(error).size(12).color(theme::COLOR_MUTED),
+                button(text("Retry").size(13))
+                    .padding([5, 12])
+                    .style(theme::surface_button)
+                    .on_press(Message::RetryNews),
+            ]
+            .spacing(8)
+            .into(),
+            NewsState::Idle | NewsState::Loading => text("Loading news...")
+                .size(14)
+                .color(theme::COLOR_MUTED)
+                .into(),
+        };
+
+        let panel = container(column![header, body].spacing(12))
+            .padding(16)
+            .width(Length::FillPortion(2))
+            .height(Length::Fill)
+            .style(|_theme: &iced::Theme| container::Style {
+                background: Some(Background::Color(Color {
+                    a: 0.92,
+                    ..theme::COLOR_PANEL
+                })),
+                border: Border {
+                    color: theme::COLOR_BORDER,
+                    width: 1.0,
+                    radius: 14.into(),
+                },
+                ..container::Style::default()
+            });
+
+        container(row![space().width(Length::FillPortion(1)), panel])
+            .padding(16)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
+    fn view_news_card<'a>(
+        &'a self,
+        item: &'a NewsItem,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Element<'a, Message> {
+        let mut text_column = column![text(&item.title).size(15).color(Color::WHITE)].spacing(4);
+        if !item.description.is_empty() {
+            text_column =
+                text_column.push(text(&item.description).size(12).color(theme::COLOR_HINT));
+        }
+        text_column =
+            text_column.push(text(item.age_label(now)).size(11).color(theme::COLOR_MUTED));
+
+        let mut card = row![].spacing(12);
+        if self.config.news_thumbnails
+            && let Some(path) = &item.thumbnail
+        {
+            card = card.push(
+                container(
+                    image(image::Handle::from_path(path))
+                        .content_fit(iced::ContentFit::Cover)
+                        .width(120)
+                        .height(68),
+                )
+                .clip(true)
+                .style(|_theme: &iced::Theme| container::Style {
+                    border: Border::default().rounded(8),
+                    ..container::Style::default()
+                }),
+            );
+        }
+        card = card.push(text_column.width(Length::Fill));
+
+        button(card)
+            .padding(10)
+            .width(Length::Fill)
+            .style(news_card_style)
+            .on_press(Message::OpenUrl(item.url.clone()))
+            .into()
     }
 
     fn view_play_panel(&self, selected: Option<&GameClient>) -> Element<'_, Message> {
@@ -391,6 +528,37 @@ impl App {
             }
         }
         line.into()
+    }
+}
+
+fn news_button_style(_theme: &iced::Theme, status: button::Status) -> button::Style {
+    let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+    button::Style {
+        background: Some(Background::Color(Color {
+            a: if hovered { 0.95 } else { 0.8 },
+            ..theme::COLOR_PANEL
+        })),
+        text_color: theme::COLOR_GOLD,
+        border: Border {
+            color: theme::COLOR_GOLD,
+            width: 1.0,
+            radius: 14.into(),
+        },
+        ..button::Style::default()
+    }
+}
+
+fn news_card_style(theme: &iced::Theme, status: button::Status) -> button::Style {
+    let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+    button::Style {
+        background: Some(Background::Color(if hovered {
+            theme::COLOR_SURFACE_HOVER
+        } else {
+            theme::COLOR_SURFACE
+        })),
+        text_color: theme.palette().text,
+        border: Border::default().rounded(10),
+        ..button::Style::default()
     }
 }
 
